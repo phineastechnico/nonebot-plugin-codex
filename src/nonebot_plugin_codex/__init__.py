@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+from nonebot import get_plugin_config, on_command, on_message, on_type
+from nonebot.plugin import PluginMetadata
 from nonebot.params import CommandArg
 from nonebot.adapters.telegram import Bot
-from nonebot.plugin import PluginMetadata
 from nonebot.adapters.telegram.message import Message
-from nonebot.adapters.telegram import Adapter as TelegramAdapter
-from nonebot import on_type, on_command, on_message, get_plugin_config
 from nonebot.adapters.telegram.event import MessageEvent, CallbackQueryEvent
 
 from .config import Config
@@ -23,7 +22,7 @@ __plugin_meta__ = PluginMetadata(
     homepage="https://github.com/ttiee/nonebot-plugin-codex",
     type="application",
     config=Config,
-    supported_adapters={TelegramAdapter},
+    supported_adapters={"~telegram"},
 )
 
 try:
