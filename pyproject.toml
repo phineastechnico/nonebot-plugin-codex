@@ -1,14 +1,15 @@
 [project]
-name = "nonebot-plugin-template"
+name = "nonebot-plugin-codex"
 version = "0.1.0"
-description = "<your_plugin_description>"
+description = "Telegram bridge plugin for driving Codex from NoneBot"
 authors = [
-    {name = "<your_github>", email = "<your_email>"},
+    {name = "ttiee", email = "469784630@qq.com"},
 ]
 dependencies = [
-    "nonebot2>=2.3.1",
+    "nonebot2>=2.4.4",
+    "nonebot-adapter-telegram>=0.1.0b20",
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 readme = "README.md"
 license = {text = "MIT"}
 
@@ -28,16 +29,18 @@ dev = [
     "black>=24.4.2",
     "isort>=5.13.2",
     "ruff>=0.4.6",
+    "pytest>=8.3.5",
+    "pytest-asyncio>=0.24.0",
 ]
 
 [tool.pdm.scripts]
 format = { composite = ["isort . ","black . ","ruff check ."] }
-test = "python -c 'print(\">>> Just \\\"pytest -W ignore -s\\\" when you complete your testsuite\")'"
+test = "pytest"
 
 
 [tool.black]
 line-length = 90
-target-version = ["py39", "py310", "py311", "py312"]
+target-version = ["py310", "py311", "py312"]
 include = '\.pyi?$'
 extend-exclude = '''
 '''
@@ -52,14 +55,14 @@ extra_standard_library = ["typing_extensions"]
 
 [tool.ruff]
 line-length = 90
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "UP", "C", "T", "PYI", "PT", "Q"]
 ignore = ["C901", "T201", "E731", "E402"]
 
 [tool.pyright]
-pythonVersion = "3.9"
+pythonVersion = "3.10"
 pythonPlatform = "All"
 typeCheckingMode = "basic"
 
