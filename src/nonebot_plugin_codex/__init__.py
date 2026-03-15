@@ -3,14 +3,21 @@ from __future__ import annotations
 from pathlib import Path
 
 from nonebot import get_plugin_config, on_command, on_message, on_type, require
+from nonebot.drivers import Driver
+from nonebot.log import logger
 from nonebot.plugin import PluginMetadata
 from nonebot.params import CommandArg
 from nonebot.adapters.telegram import Bot
 from nonebot.adapters.telegram.message import Message
 from nonebot.adapters.telegram.event import MessageEvent, CallbackQueryEvent
+from nonebot.adapters.telegram.model import (
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+)
 
 from .config import Config
 from .telegram import TelegramHandlers
+from .telegram_commands import build_plugin_usage, build_telegram_commands
 from .native_client import NativeCodexClient
 from .runtime import build_service_settings
 from .service import CodexBridgeService
@@ -18,10 +25,7 @@ from .service import CodexBridgeService
 __plugin_meta__ = PluginMetadata(
     name="Codex",
     description="Telegram bridge plugin for driving Codex from NoneBot",
-    usage=(
-        "/codex [prompt], /mode, /exec, /new, /stop, /models, /model, /effort, "
-        "/permission, /pwd, /cd, /home, /sessions"
-    ),
+    usage=build_plugin_usage(),
     homepage="https://github.com/ttiee/nonebot-plugin-codex",
     type="application",
     config=Config,
@@ -58,7 +62,29 @@ service = CodexBridgeService(
 )
 handlers = TelegramHandlers(service)
 
+
+async def sync_telegram_commands(bot: Bot) -> bool:
+    synced = True
+    scopes = (
+        BotCommandScopeAllPrivateChats(),
+        BotCommandScopeAllGroupChats(),
+    )
+    commands = build_telegram_commands()
+    for scope in scopes:
+        try:
+            await bot.set_my_commands(commands, scope=scope)
+        except Exception as exc:
+            logger.warning(f"Telegram 命令菜单同步失败（{scope.type}）：{exc}")
+            synced = False
+    return synced
+
 if _runtime_ready:
+    @Driver.on_bot_connect
+    async def _sync_telegram_commands(bot: Bot) -> None:
+        if not isinstance(bot, Bot):
+            return
+        await sync_telegram_commands(bot)
+
     codex_cmd = on_command("codex", priority=10, block=True)
     mode_cmd = on_command("mode", priority=10, block=True)
     exec_cmd = on_command("exec", priority=10, block=True)

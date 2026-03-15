@@ -165,17 +165,17 @@ codex_stream_read_limit = 1048576
 
 | 命令 | 说明 |
 | --- | --- |
-| `/codex [prompt]` | 连接 Codex，会附带发送首条 prompt |
+| `/codex [prompt]` | 连接 Codex 并可附带首条任务 |
 | `/mode [resume\|exec]` | 查看或切换默认模式 |
 | `/exec <prompt>` | 以一次性 `exec` 模式执行任务 |
-| `/new` | 清空当前聊天绑定的会话 |
-| `/stop` | 断开当前聊天的 Codex 会话 |
-| `/models` | 查看可用模型 |
-| `/model [slug]` | 查看或切换模型 |
+| `/new` | 新建当前聊天会话 |
+| `/stop` | 停止当前聊天中的 Codex |
+| `/models` | 查看可用模型列表 |
+| `/model [slug]` | 查看或切换当前模型 |
 | `/effort [high\|xhigh]` | 查看或切换推理强度 |
 | `/permission [safe\|danger]` | 查看或切换权限模式 |
-| `/pwd` | 查看当前工作目录与当前设置 |
-| `/cd [path]` | 直接切换目录；不带参数时打开目录浏览器 |
+| `/pwd` | 查看当前工作目录和设置 |
+| `/cd [path]` | 切换目录或打开目录浏览器 |
 | `/home` | 将工作目录重置到 Home |
 | `/sessions` | 打开历史会话浏览器 |
 
