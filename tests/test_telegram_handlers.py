@@ -297,7 +297,9 @@ def make_real_service(
             workdir=workdir or str(tmp_path),
             models_cache_path=model_cache_file,
             codex_config_path=codex_config,
-            preferences_path=tmp_path / "data" / "codex_bridge" / "preferences.json",
+            preferences_path=(
+                tmp_path / "data" / "nonebot_plugin_codex" / "preferences.json"
+            ),
             session_index_path=tmp_path / ".codex" / "session_index.jsonl",
             sessions_dir=tmp_path / ".codex" / "sessions",
             archived_sessions_dir=tmp_path / ".codex" / "archived_sessions",
@@ -315,7 +317,9 @@ def make_real_service_without_model_cache(tmp_path: Path) -> CodexBridgeService:
             workdir=str(tmp_path),
             models_cache_path=tmp_path / "missing-models.json",
             codex_config_path=codex_config,
-            preferences_path=tmp_path / "data" / "codex_bridge" / "preferences.json",
+            preferences_path=(
+                tmp_path / "data" / "nonebot_plugin_codex" / "preferences.json"
+            ),
             session_index_path=tmp_path / ".codex" / "session_index.jsonl",
             sessions_dir=tmp_path / ".codex" / "sessions",
             archived_sessions_dir=tmp_path / ".codex" / "archived_sessions",

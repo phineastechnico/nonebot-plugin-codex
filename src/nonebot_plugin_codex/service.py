@@ -56,7 +56,7 @@ class CodexBridgeSettings:
         default_factory=lambda: Path.home() / ".codex" / "config.toml"
     )
     preferences_path: Path = field(
-        default_factory=lambda: Path("data") / "codex_bridge" / "preferences.json"
+        default_factory=lambda: Path("data") / "nonebot_plugin_codex" / "preferences.json"
     )
     session_index_path: Path = field(
         default_factory=lambda: Path.home() / ".codex" / "session_index.jsonl"

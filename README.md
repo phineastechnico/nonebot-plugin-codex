@@ -37,7 +37,7 @@ _✨ 在 Telegram 里驱动 Codex CLI 的 NoneBot 插件 ✨_
 - 支持 `resume` 与 `exec` 两种运行模式
 - 每个聊天独立维护模型、推理强度、权限模式和工作目录
 - 可视化浏览目录与历史会话
-- 兼容既有 `codex_bridge` 偏好文件与 `~/.codex/*` 历史数据
+- 插件自身状态使用 localstore 管理，本地 Codex 历史读取 `~/.codex/*`
 
 如果你已经习惯在本机使用 Codex，又希望通过 Telegram 远程发起编码、排查、审阅或文档整理任务，这个插件就是为这个场景设计的。
 
@@ -48,7 +48,7 @@ _✨ 在 Telegram 里驱动 Codex CLI 的 NoneBot 插件 ✨_
 - **细粒度会话隔离**：不同聊天各自持有模型、权限、工作目录与历史绑定。
 - **目录浏览能力**：支持在 Telegram 内切换目录、设定 Home、查看隐藏目录。
 - **历史会话恢复**：可浏览 native 与 exec 历史，并尽量恢复原始工作目录。
-- **兼容迁移**：可以沿用旧偏好文件与 Codex 历史目录，减少迁移成本。
+- **兼容迁移**：可以沿用旧配置文件与 Codex 历史目录，减少迁移成本。
 
 ## 快速开始
 
@@ -151,32 +151,15 @@ codex_chunk_size = 3500
 # 读取 Codex stdout / stderr 的缓冲区大小
 codex_stream_read_limit = 1048576
 
-# Codex 模型缓存文件；`/models` 和 `/model` 会读取它
-codex_models_cache_path = "/home/yourname/.codex/models_cache.json"
-
-# Codex CLI 配置文件；会从这里读取默认模型和推理强度
-codex_codex_config_path = "/home/yourname/.codex/config.toml"
-
-# 插件自己的偏好文件，保存每个聊天的模型、权限、工作目录和默认模式
-codex_preferences_path = "data/codex_bridge/preferences.json"
-
-# Codex 历史会话索引；`/sessions` 会先读取这里
-codex_session_index_path = "/home/yourname/.codex/session_index.jsonl"
-
-# Codex 当前会话日志目录；用于补充标题、预览和 cwd 信息
-codex_sessions_dir = "/home/yourname/.codex/sessions"
-
-# Codex 归档会话目录；历史浏览也会读取这里
-codex_archived_sessions_dir = "/home/yourname/.codex/archived_sessions"
 ```
 
 几个最关键的配置项：
 
 - `codex_binary`：如果宿主机不是直接执行 `codex`，改成实际绝对路径。
 - `codex_workdir`：默认工作目录，也是 `/cd` 相对路径解析与目录浏览器 Home 的基准。
-- `codex_preferences_path`：插件自身状态文件，不属于 Codex 官方目录，删除后会丢失各聊天保存的偏好。
-- `codex_models_cache_path`、`codex_codex_config_path`：用于读取本地模型和默认配置，通常保持默认值即可。
-- `codex_session_index_path`、`codex_sessions_dir`、`codex_archived_sessions_dir`：历史会话浏览依赖这三项；如果你的 Codex 数据目录自定义过，需要同步修改。
+- 其余项分别控制停止超时、进度保留条数、诊断输出条数、Telegram 分片长度和流读取上限。
+- 插件自己的配置数据由 `nonebot-plugin-localstore` 自动管理。
+- 模型缓存、Codex CLI 配置和历史会话目录默认读取 `~/.codex/*`，属于插件内部实现路径。
 
 ## 命令一览
 
@@ -219,16 +202,6 @@ codex_archived_sessions_dir = "/home/yourname/.codex/archived_sessions"
 - `/cd` 可打开目录浏览器，逐级进入目录、切换 Home、显示隐藏目录，并把当前浏览目录设置为工作目录。
 - `/sessions` 会列出 native 与 exec 历史会话，便于恢复此前任务。
 - 历史会话恢复时会尝试切回原始工作目录；如果原目录不存在，会保留当前目录并给出提示。
-
-## 兼容与迁移
-
-这个插件保留了与旧 `codex_bridge` 的兼容路径：
-
-- 默认偏好文件仍为 `data/codex_bridge/preferences.json`
-- 历史会话仍读取 `~/.codex/session_index.jsonl`
-- 当前与归档会话目录仍为 `~/.codex/sessions`、`~/.codex/archived_sessions`
-
-这意味着如果你之前使用的是旧目录布局，通常可以平滑迁入，而不需要额外编写迁移脚本。
 
 ## 发布说明
 

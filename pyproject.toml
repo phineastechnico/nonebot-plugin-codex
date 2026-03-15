@@ -1,6 +1,6 @@
 [project]
 name = "nonebot-plugin-codex"
-version = "0.1.1"
+version = "0.1.2"
 description = "Telegram bridge plugin for driving Codex from NoneBot"
 authors = [
     {name = "ttiee", email = "469784630@qq.com"},
@@ -8,6 +8,7 @@ authors = [
 dependencies = [
     "nonebot2>=2.4.4",
     "nonebot-adapter-telegram>=0.1.0b20",
+    "nonebot-plugin-localstore>=0.7.4",
     "tomli>=2.0.1; python_version < '3.11'",
 ]
 requires-python = ">=3.10"

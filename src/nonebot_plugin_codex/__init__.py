@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from nonebot import get_plugin_config, on_command, on_message, on_type
+from pathlib import Path
+
+from nonebot import get_plugin_config, on_command, on_message, on_type, require
 from nonebot.plugin import PluginMetadata
 from nonebot.params import CommandArg
 from nonebot.adapters.telegram import Bot
@@ -10,7 +12,8 @@ from nonebot.adapters.telegram.event import MessageEvent, CallbackQueryEvent
 from .config import Config
 from .telegram import TelegramHandlers
 from .native_client import NativeCodexClient
-from .service import CodexBridgeService, CodexBridgeSettings
+from .runtime import build_service_settings
+from .service import CodexBridgeService
 
 __plugin_meta__ = PluginMetadata(
     name="Codex",
@@ -32,21 +35,21 @@ except ValueError:
     plugin_config = Config()
     _runtime_ready = False
 
+
+def _get_plugin_data_dir() -> Path:
+    try:
+        require("nonebot_plugin_localstore")
+        import nonebot_plugin_localstore as store
+
+        return store.get_plugin_data_dir()
+    except Exception:
+        return Path("data") / "nonebot_plugin_codex"
+
+
 service = CodexBridgeService(
-    CodexBridgeSettings(
-        binary=plugin_config.codex_binary,
-        workdir=str(plugin_config.codex_workdir),
-        kill_timeout=plugin_config.codex_kill_timeout,
-        progress_history=plugin_config.codex_progress_history,
-        diagnostic_history=plugin_config.codex_diagnostic_history,
-        chunk_size=plugin_config.codex_chunk_size,
-        stream_read_limit=plugin_config.codex_stream_read_limit,
-        models_cache_path=plugin_config.codex_models_cache_path,
-        codex_config_path=plugin_config.codex_codex_config_path,
-        preferences_path=plugin_config.codex_preferences_path,
-        session_index_path=plugin_config.codex_session_index_path,
-        sessions_dir=plugin_config.codex_sessions_dir,
-        archived_sessions_dir=plugin_config.codex_archived_sessions_dir,
+    build_service_settings(
+        plugin_config,
+        plugin_data_dir=_get_plugin_data_dir(),
     ),
     native_client=NativeCodexClient(
         binary=plugin_config.codex_binary,
