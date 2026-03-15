@@ -27,6 +27,13 @@ _✨ 在 Telegram 里驱动 Codex CLI 的 NoneBot 插件 ✨_
 
 </div>
 
+<p align="center">
+  <img src="docs/images/readme/1.jpg" width="24%" alt="nonebot-plugin-codex screenshot 1">
+  <img src="docs/images/readme/2.jpg" width="24%" alt="nonebot-plugin-codex screenshot 2">
+  <img src="docs/images/readme/3.jpg" width="24%" alt="nonebot-plugin-codex screenshot 3">
+  <img src="docs/images/readme/4.jpg" width="24%" alt="nonebot-plugin-codex screenshot 4">
+</p>
+
 ## 项目介绍
 
 `nonebot-plugin-codex` 是一个面向 Telegram 场景的 NoneBot 插件，用来把本机 `codex` CLI 暴露为可对话、可续聊、可管理工作目录的聊天式开发助手。
