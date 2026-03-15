@@ -43,6 +43,12 @@ def test_config_accepts_supported_field_values() -> None:
     assert config.codex_stream_read_limit == 4096
 
 
+def test_config_defaults_stream_limit_to_8_mib() -> None:
+    config = Config()
+
+    assert config.codex_stream_read_limit == 8 * 1024 * 1024
+
+
 def test_config_ignores_removed_legacy_fields() -> None:
     config = Config(
         legacy_binary="legacy-bin",

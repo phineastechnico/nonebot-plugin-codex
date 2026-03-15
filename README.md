@@ -174,8 +174,8 @@ codex_diagnostic_history = 20
 # 单条 Telegram 消息的分片长度，过长回复会自动拆分
 codex_chunk_size = 3500
 
-# 读取 Codex stdout / stderr 的缓冲区大小
-codex_stream_read_limit = 1048576
+# 单条 Codex 协议消息允许的最大字节数
+codex_stream_read_limit = 8388608
 
 ```
 
@@ -183,7 +183,8 @@ codex_stream_read_limit = 1048576
 
 - `codex_binary`：如果宿主机不是直接执行 `codex`，改成实际绝对路径。
 - `codex_workdir`：默认工作目录，也是 `/cd` 相对路径解析与目录浏览器 Home 的基准。
-- 其余项分别控制停止超时、进度保留条数、诊断输出条数、Telegram 分片长度和流读取上限。
+- `codex_stream_read_limit`：限制单条 Codex 协议帧的最大字节数，不是 Telegram 消息分片长度。
+- 其余项分别控制停止超时、进度保留条数、诊断输出条数和 Telegram 分片长度。
 - 插件自己的配置数据由 `nonebot-plugin-localstore` 自动管理。
 - 模型缓存、Codex CLI 配置和历史会话目录默认读取 `~/.codex/*`，属于插件内部实现路径。
 

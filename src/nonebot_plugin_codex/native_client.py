@@ -7,6 +7,8 @@ from dataclasses import field, dataclass
 from typing import Any
 from collections.abc import Callable, Awaitable
 
+from .protocol_io import NdjsonProcessReader, ProtocolStreamError
+
 Callback = Callable[[str], object]
 ProcessLauncher = Callable[..., Awaitable[Any]]
 
@@ -93,7 +95,7 @@ class NativeCodexClient:
         launcher: ProcessLauncher | None = None,
         client_name: str = "tg_bot",
         client_version: str = "0",
-        stream_read_limit: int = 1024 * 1024,
+        stream_read_limit: int = 8 * 1024 * 1024,
     ) -> None:
         self.binary = binary
         self.launcher = launcher or asyncio.create_subprocess_exec
@@ -101,6 +103,7 @@ class NativeCodexClient:
         self.client_version = client_version
         self.stream_read_limit = stream_read_limit
         self._process: Any = None
+        self._reader: NdjsonProcessReader | None = None
         self._initialized = False
         self._next_request_id = 1
 
@@ -115,10 +118,14 @@ class NativeCodexClient:
 
     async def close(self, timeout: float = 5.0) -> None:
         process = self._process
+        reader = self._reader
         self._process = None
+        self._reader = None
         self._initialized = False
         self._next_request_id = 1
         await _terminate_process(process, timeout)
+        if reader is not None:
+            await reader.wait_closed()
 
     async def start_thread(
         self,
@@ -322,8 +329,12 @@ class NativeCodexClient:
             "stdio://",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stderr=asyncio.subprocess.PIPE,
             limit=self.stream_read_limit,
+        )
+        self._reader = NdjsonProcessReader(
+            self._process,
+            frame_limit=self.stream_read_limit,
         )
         request_id = self._allocate_request_id()
         await self._write_message(
@@ -398,12 +409,19 @@ class NativeCodexClient:
             return result
 
     async def _read_message(self, diagnostics: list[str]) -> dict[str, Any] | None:
-        if self._process is None or getattr(self._process, "stdout", None) is None:
+        if self._process is None or self._reader is None:
             raise RuntimeError("Codex app-server 尚未启动。")
-        raw_line = await self._process.stdout.readline()
-        if not raw_line:
+
+        diagnostics.extend(self._reader.drain_stderr_lines())
+        try:
+            line = await self._reader.read_stdout_line()
+        except ProtocolStreamError as exc:
+            diagnostics.extend(self._reader.drain_stderr_lines())
+            raise RuntimeError(str(exc)) from exc
+        diagnostics.extend(self._reader.drain_stderr_lines())
+
+        if line is None:
             raise RuntimeError("Codex app-server 已提前退出。")
-        line = raw_line.decode("utf-8", errors="replace").strip()
         if not line:
             return None
         try:

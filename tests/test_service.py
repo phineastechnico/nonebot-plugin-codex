@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -33,6 +35,8 @@ def make_service(
     model_cache_file: Path,
     *,
     threads: list[NativeThreadSummary] | None = None,
+    launcher=None,
+    stream_read_limit: int = 1024 * 1024,
 ) -> CodexBridgeService:
     codex_config = tmp_path / "config.toml"
     codex_config.write_text('model = "gpt-5"\nmodel_reasoning_effort = "xhigh"\n')
@@ -42,6 +46,7 @@ def make_service(
             workdir=str(tmp_path),
             models_cache_path=model_cache_file,
             codex_config_path=codex_config,
+            stream_read_limit=stream_read_limit,
             preferences_path=(
                 tmp_path / "data" / "nonebot_plugin_codex" / "preferences.json"
             ),
@@ -49,6 +54,7 @@ def make_service(
             sessions_dir=tmp_path / ".codex" / "sessions",
             archived_sessions_dir=tmp_path / ".codex" / "archived_sessions",
         ),
+        launcher=launcher,
         native_client=DummyNativeClient(threads),
         which_resolver=lambda _: "/usr/bin/codex",
     )
@@ -539,3 +545,102 @@ async def test_apply_effort_setting_panel_accepts_model_supported_medium(
 
     assert "medium" in notice
     assert service.get_preferences("private_1").reasoning_effort == "medium"
+
+
+@pytest.mark.asyncio
+async def test_run_prompt_exec_ignores_large_stderr_frames(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    huge_stderr = "E" * 4096
+    completed_payload = {
+        "type": "item.completed",
+        "item": {"type": "agent_message", "text": "done"},
+    }
+    script = (
+        "import json, sys\n"
+        f"huge_stderr = {huge_stderr!r}\n"
+        "messages = [\n"
+        "    {'type': 'thread.started', 'thread_id': 'exec-1'},\n"
+        "    {'type': 'turn.started'},\n"
+        f"    {completed_payload!r},\n"
+        "]\n"
+        "sys.stderr.write(huge_stderr + '\\n')\n"
+        "sys.stderr.flush()\n"
+        "for message in messages:\n"
+        "    sys.stdout.write(json.dumps(message) + '\\n')\n"
+        "    sys.stdout.flush()\n"
+    )
+
+    async def launcher(*_args, **kwargs):
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            script,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=kwargs.get("stderr", asyncio.subprocess.PIPE),
+            limit=int(kwargs.get("limit", 1024)),
+        )
+
+    service = make_service(
+        tmp_path,
+        model_cache_file,
+        launcher=launcher,
+        stream_read_limit=1024,
+    )
+
+    result = await service.run_prompt("private_1", "hello", mode_override="exec")
+
+    assert result.exit_code == 0
+    assert result.final_text == "done"
+
+
+@pytest.mark.asyncio
+async def test_run_prompt_exec_returns_friendly_protocol_error_and_cleans_up(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    long_text = "A" * 4096
+    completed_payload = {
+        "type": "item.completed",
+        "item": {"type": "agent_message", "text": long_text},
+    }
+    script = (
+        "import json, sys\n"
+        f"long_text = {long_text!r}\n"
+        "messages = [\n"
+        "    {'type': 'thread.started', 'thread_id': 'exec-1'},\n"
+        "    {'type': 'turn.started'},\n"
+        f"    {completed_payload!r},\n"
+        "]\n"
+        "for message in messages:\n"
+        "    sys.stdout.write(json.dumps(message) + '\\n')\n"
+        "    sys.stdout.flush()\n"
+    )
+
+    async def launcher(*_args, **kwargs):
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            script,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=kwargs.get("stderr", asyncio.subprocess.PIPE),
+            limit=int(kwargs.get("limit", 1024)),
+        )
+
+    service = make_service(
+        tmp_path,
+        model_cache_file,
+        launcher=launcher,
+        stream_read_limit=1024,
+    )
+
+    result = await service.run_prompt("private_1", "hello", mode_override="exec")
+    session = service.get_session("private_1")
+
+    assert result.exit_code == 1
+    assert any("codex_stream_read_limit" in line for line in result.diagnostics)
+    assert session.running is False
+    assert session.process is None

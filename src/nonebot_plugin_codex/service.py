@@ -18,6 +18,7 @@ from dataclasses import field, asdict, dataclass
 from nonebot.adapters.telegram.model import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .native_client import NativeCodexClient
+from .protocol_io import NdjsonProcessReader, ProtocolStreamError
 
 ProgressCallback = Callable[[str], Awaitable[None]]
 StreamTextCallback = Callable[[str], Awaitable[None]]
@@ -52,7 +53,7 @@ class CodexBridgeSettings:
     progress_history: int = 6
     diagnostic_history: int = 20
     chunk_size: int = 3500
-    stream_read_limit: int = 1024 * 1024
+    stream_read_limit: int = 8 * 1024 * 1024
     models_cache_path: Path = field(
         default_factory=lambda: Path.home() / ".codex" / "models_cache.json"
     )
@@ -466,6 +467,16 @@ def _append_diagnostic(session: ChatSession, line: str, limit: int) -> None:
     session.diagnostics.append(line)
     if len(session.diagnostics) > limit:
         del session.diagnostics[:-limit]
+
+
+def _drain_protocol_reader_diagnostics(
+    session: ChatSession,
+    reader: NdjsonProcessReader,
+    *,
+    limit: int,
+) -> None:
+    for line in reader.drain_stderr_lines():
+        _append_diagnostic(session, line, limit)
 
 
 def _apply_event(
@@ -2994,11 +3005,15 @@ class CodexBridgeService:
         process = await self.launcher(
             *argv,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stderr=asyncio.subprocess.PIPE,
             cwd=preferences.workdir,
             limit=self.settings.stream_read_limit,
         )
         session.process = process
+        reader = NdjsonProcessReader(
+            process,
+            frame_limit=self.settings.stream_read_limit,
+        )
 
         if on_progress is not None:
             await on_progress(
@@ -3012,13 +3027,23 @@ class CodexBridgeService:
                 )
             )
 
-        stdout = getattr(process, "stdout", None)
+        exit_code: int | None = None
+        cancelled = False
         try:
-            while stdout is not None:
-                raw_line = await stdout.readline()
-                if not raw_line:
+            while True:
+                _drain_protocol_reader_diagnostics(
+                    session,
+                    reader,
+                    limit=self.settings.diagnostic_history,
+                )
+                line = await reader.read_stdout_line()
+                _drain_protocol_reader_diagnostics(
+                    session,
+                    reader,
+                    limit=self.settings.diagnostic_history,
+                )
+                if line is None:
                     break
-                line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
                 event = parse_event_line(line)
@@ -3042,10 +3067,21 @@ class CodexBridgeService:
 
             exit_code = await process.wait()
             cancelled = session.cancel_requested
+        except ProtocolStreamError as exc:
+            _append_diagnostic(session, str(exc), self.settings.diagnostic_history)
+            await terminate_process(process, self.settings.kill_timeout)
+            exit_code = 1
+            cancelled = session.cancel_requested
         except Exception:
             await terminate_process(process, self.settings.kill_timeout)
             raise
         finally:
+            await reader.wait_closed()
+            _drain_protocol_reader_diagnostics(
+                session,
+                reader,
+                limit=self.settings.diagnostic_history,
+            )
             session.running = False
             session.process = None
             session.cancel_requested = False

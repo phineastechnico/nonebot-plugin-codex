@@ -12,4 +12,4 @@ class Config(BaseModel):
     codex_progress_history: int = 6
     codex_diagnostic_history: int = 20
     codex_chunk_size: int = 3500
-    codex_stream_read_limit: int = 1024 * 1024
+    codex_stream_read_limit: int = 8 * 1024 * 1024
