@@ -4,7 +4,7 @@ import argparse
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -125,7 +125,7 @@ def render_release_notes(
     items: Sequence[ReleaseNoteItem],
 ) -> str:
     lines = [f"# {current_tag}", ""]
-    timestamp = datetime.now(UTC).strftime("%Y-%m-%d")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     lines.append(f"Released on {timestamp}.")
     compare_url = build_compare_url(repo, previous_tag, current_tag)
     if previous_tag is None:
