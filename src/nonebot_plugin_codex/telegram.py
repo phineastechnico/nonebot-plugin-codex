@@ -11,6 +11,7 @@ from nonebot.adapters.telegram.exception import ActionFailed, NetworkError
 from nonebot.adapters.telegram.event import MessageEvent, CallbackQueryEvent
 
 from .service import (
+    AgentPanelState,
     BROWSER_STALE_MESSAGE,
     HISTORY_STALE_MESSAGE,
     BROWSER_CALLBACK_PREFIX,
@@ -21,6 +22,7 @@ from .service import (
     SETTING_CALLBACK_PREFIX,
     WORKSPACE_STALE_MESSAGE,
     WORKSPACE_CALLBACK_PREFIX,
+    AgentPanelUpdate,
     CodexBridgeService,
     chunk_text,
     build_chat_key,
@@ -162,22 +164,63 @@ class TelegramHandlers:
                 )
             )
 
-    async def update_progress(self, bot: Bot, event: MessageEvent, text: str) -> None:
+    def render_agent_panel_text(self, label: str, text: str) -> str:
+        return f"{label}\n{text}" if text else label
+
+    def ensure_agent_panel(
+        self,
+        event: MessageEvent,
+        *,
+        agent_key: str,
+        agent_label: str,
+    ) -> AgentPanelState:
         session = self.service.get_session(self.chat_key(event))
-        if session.progress_message_id is None:
+        panel = session.agent_panels.get(agent_key)
+        if panel is not None:
+            return panel
+        panel = AgentPanelState(agent_key=agent_key, agent_label=agent_label)
+        session.agent_panels[agent_key] = panel
+        session.agent_order.append(agent_key)
+        return panel
+
+    def reset_agent_panels(self, event: MessageEvent) -> None:
+        session = self.service.get_session(self.chat_key(event))
+        if not session.agent_order:
+            panel = AgentPanelState(agent_key="main", agent_label="主 agent")
+            session.agent_panels["main"] = panel
+            session.agent_order.append("main")
+        for panel in session.agent_panels.values():
+            panel.progress_message_id = None
+            panel.stream_message_id = None
+            panel.last_stream_rendered_text = ""
+            panel.stream_message_truncated = False
+
+    async def update_progress(
+        self,
+        bot: Bot,
+        event: MessageEvent,
+        update: AgentPanelUpdate,
+    ) -> None:
+        panel = self.ensure_agent_panel(
+            event,
+            agent_key=update.agent_key,
+            agent_label=update.agent_label,
+        )
+        text = self.render_agent_panel_text(update.agent_label, update.text)
+        if panel.progress_message_id is None:
             message = await self.send_event_message(bot, event, text)
-            session.progress_message_id = getattr(message, "message_id", None)
+            panel.progress_message_id = getattr(message, "message_id", None)
             return
         try:
             await self.edit_message(
                 bot,
                 chat_id=event.chat.id,
-                message_id=session.progress_message_id,
+                message_id=panel.progress_message_id,
                 text=text,
             )
         except Exception:
             message = await self.send_event_message(bot, event, text)
-            session.progress_message_id = getattr(message, "message_id", None)
+            panel.progress_message_id = getattr(message, "message_id", None)
 
     def render_stream_text(self, text: str) -> tuple[str, bool]:
         chunks = chunk_text(text, self.service.settings.chunk_size)
@@ -187,45 +230,68 @@ class TelegramHandlers:
             return chunks[0], False
         return chunks[-1], True
 
-    async def update_stream_text(self, bot: Bot, event: MessageEvent, text: str) -> None:
-        session = self.service.get_session(self.chat_key(event))
+    async def update_stream_text(
+        self,
+        bot: Bot,
+        event: MessageEvent,
+        update: AgentPanelUpdate,
+    ) -> None:
+        panel = self.ensure_agent_panel(
+            event,
+            agent_key=update.agent_key,
+            agent_label=update.agent_label,
+        )
+        text = self.render_agent_panel_text(update.agent_label, update.text)
         rendered_text, truncated = self.render_stream_text(text)
         if not rendered_text:
             return
-        session.stream_message_truncated = truncated
-        if rendered_text == session.last_stream_rendered_text:
+        panel.stream_message_truncated = truncated
+        panel.last_stream_text = update.text
+        if rendered_text == panel.last_stream_rendered_text:
             return
-        if session.stream_message_id is None:
+        if panel.stream_message_id is None:
             message = await self.send_event_message(bot, event, rendered_text)
-            session.stream_message_id = getattr(message, "message_id", None)
+            panel.stream_message_id = getattr(message, "message_id", None)
         else:
             try:
                 await self.edit_message(
                     bot,
                     chat_id=event.chat.id,
-                    message_id=session.stream_message_id,
+                    message_id=panel.stream_message_id,
                     text=rendered_text,
                 )
             except Exception:
                 message = await self.send_event_message(bot, event, rendered_text)
-                session.stream_message_id = getattr(message, "message_id", None)
-        session.last_stream_rendered_text = rendered_text
+                panel.stream_message_id = getattr(message, "message_id", None)
+        panel.last_stream_rendered_text = rendered_text
 
-    async def finalize_progress(self, bot: Bot, event: MessageEvent, text: str) -> None:
-        session = self.service.get_session(self.chat_key(event))
-        if session.progress_message_id is None:
+    async def finalize_agent_progress(
+        self,
+        bot: Bot,
+        event: MessageEvent,
+        *,
+        agent_key: str,
+        agent_label: str,
+        text: str,
+    ) -> None:
+        panel = self.ensure_agent_panel(
+            event,
+            agent_key=agent_key,
+            agent_label=agent_label,
+        )
+        if panel.progress_message_id is None:
             return
         try:
             await self.edit_message(
                 bot,
                 chat_id=event.chat.id,
-                message_id=session.progress_message_id,
-                text=text,
+                message_id=panel.progress_message_id,
+                text=self.render_agent_panel_text(agent_label, text),
             )
         except Exception:
             pass
         finally:
-            session.progress_message_id = None
+            panel.progress_message_id = None
 
     async def send_result(self, bot: Bot, event: MessageEvent, text: str) -> None:
         for chunk in chunk_text(text, self.service.settings.chunk_size):
@@ -271,26 +337,27 @@ class TelegramHandlers:
         session.stream_message_id = None
         session.last_stream_rendered_text = ""
         session.stream_message_truncated = False
-        last_stream_update_at = 0.0
-        pending_stream_text = ""
+        self.reset_agent_panels(event)
+        last_stream_update_at: dict[str, float] = {}
+        pending_stream_updates: dict[str, AgentPanelUpdate] = {}
 
-        async def on_progress(text: str) -> None:
-            await self.update_progress(bot, event, text)
+        async def on_progress(update: AgentPanelUpdate) -> None:
+            await self.update_progress(bot, event, update)
 
-        async def flush_stream_text() -> None:
-            nonlocal last_stream_update_at, pending_stream_text
-            if not pending_stream_text:
+        async def flush_stream_text(agent_key: str | None = None) -> None:
+            keys = [agent_key] if agent_key is not None else list(pending_stream_updates)
+            for key in keys:
+                update = pending_stream_updates.pop(key, None)
+                if update is None:
+                    continue
+                await self.update_stream_text(bot, event, update)
+                last_stream_update_at[key] = time.monotonic()
+
+        async def on_stream_text(update: AgentPanelUpdate) -> None:
+            pending_stream_updates[update.agent_key] = update
+            if time.monotonic() - last_stream_update_at.get(update.agent_key, 0.0) < 0.5:
                 return
-            await self.update_stream_text(bot, event, pending_stream_text)
-            pending_stream_text = ""
-            last_stream_update_at = time.monotonic()
-
-        async def on_stream_text(text: str) -> None:
-            nonlocal pending_stream_text
-            pending_stream_text = text
-            if time.monotonic() - last_stream_update_at < 0.5:
-                return
-            await flush_stream_text()
+            await flush_stream_text(update.agent_key)
 
         try:
             result = await self.service.run_prompt(
@@ -311,15 +378,45 @@ class TelegramHandlers:
 
         await flush_stream_text()
         if result.cancelled:
-            await self.finalize_progress(bot, event, "Codex 已中断。")
+            for panel in (
+                session.agent_panels[agent_key]
+                for agent_key in session.agent_order
+                if agent_key in session.agent_panels
+            ):
+                await self.finalize_agent_progress(
+                    bot,
+                    event,
+                    agent_key=panel.agent_key,
+                    agent_label=panel.agent_label,
+                    text=f"{panel.agent_label} 已中断。",
+                )
             return
 
         status = "Codex 已完成。" if result.exit_code == 0 else "Codex 执行失败。"
-        await self.finalize_progress(bot, event, status)
+        for panel in (
+            session.agent_panels[agent_key]
+            for agent_key in session.agent_order
+            if agent_key in session.agent_panels
+        ):
+            panel_status = (
+                status
+                if panel.agent_key == "main"
+                else f"{panel.agent_label} 已完成。"
+            )
+            await self.finalize_agent_progress(
+                bot,
+                event,
+                agent_key=panel.agent_key,
+                agent_label=panel.agent_label,
+                text=panel_status,
+            )
+        main_panel = session.agent_panels.get("main")
         if (
+            main_panel is not None
+            and
             result.final_text
-            and result.final_text == session.last_stream_text
-            and not session.stream_message_truncated
+            and result.final_text == main_panel.last_stream_text
+            and not main_panel.stream_message_truncated
         ):
             if result.notice:
                 await self.send_result(bot, event, result.notice)

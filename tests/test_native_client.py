@@ -110,8 +110,8 @@ async def test_native_client_start_resume_and_stream_text() -> None:
         return process
 
     client = NativeCodexClient(binary="codex", launcher=launcher)
-    progress: list[str] = []
-    streamed: list[str] = []
+    progress: list[Any] = []
+    streamed: list[Any] = []
 
     thread = await client.start_thread(
         workdir="/tmp/work",
@@ -128,10 +128,380 @@ async def test_native_client_start_resume_and_stream_text() -> None:
 
     assert requests[0][0][:3] == ("codex", "app-server", "--listen")
     assert thread.thread_id == "thread-1"
-    assert progress == ["开始处理请求"]
-    assert streamed == ["hello"]
+    assert [(entry.agent_key, entry.text) for entry in progress] == [
+        ("main", "开始处理请求")
+    ]
+    assert [(entry.agent_key, entry.text) for entry in streamed] == [
+        ("main", "hello")
+    ]
     assert result.exit_code == 0
-    assert result.final_text == ""
+    assert result.final_text == "hello"
+
+
+@pytest.mark.asyncio
+async def test_native_client_ignores_commentary_text_and_reports_subagent_progress(
+) -> None:
+    process = FakeProcess(
+        stdout=FakeStdout(
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {
+                            "thread": {
+                                "id": "thread-1",
+                                "name": "Thread One",
+                                "updatedAt": "2025-03-01T00:00:00Z",
+                                "cwd": "/tmp/work",
+                                "source": "cli",
+                            }
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps({"jsonrpc": "2.0", "id": 3, "result": {}}) + "\n",
+                json.dumps({"jsonrpc": "2.0", "method": "turn/started", "params": {}})
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/agentMessage/delta",
+                        "params": {"itemId": "msg-1", "delta": "main planning note"},
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "item": {
+                                "id": "msg-1",
+                                "type": "agentMessage",
+                                "text": "main planning note",
+                                "phase": "commentary",
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "thread-1",
+                            "item": {
+                                "id": "collab-1",
+                                "type": "collabAgentToolCall",
+                                "tool": "spawnAgent",
+                                "status": "inProgress",
+                                "prompt": (
+                                    "Write regression tests "
+                                    "for the Telegram bridge"
+                                ),
+                                "senderThreadId": "thread-1",
+                                "receiverThreadIds": ["agent-1"],
+                                "agentsStates": {
+                                    "agent-1": {
+                                        "status": "running",
+                                        "message": "writing tests",
+                                    }
+                                },
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "agent-1",
+                            "item": {
+                                "id": "msg-raw-child",
+                                "type": "agentMessage",
+                                "text": "raw child answer",
+                                "phase": "commentary",
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "item": {
+                                "id": "collab-1",
+                                "type": "collabAgentToolCall",
+                                "tool": "wait",
+                                "status": "completed",
+                                "prompt": None,
+                                "senderThreadId": "thread-1",
+                                "receiverThreadIds": ["agent-1"],
+                                "agentsStates": {
+                                    "agent-1": {
+                                        "status": "completed",
+                                        "message": "tests ready",
+                                    }
+                                },
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/agentMessage/delta",
+                        "params": {"itemId": "msg-2", "delta": "main final"},
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "item": {
+                                "id": "msg-2",
+                                "type": "agentMessage",
+                                "text": "main final",
+                                "phase": "final_answer",
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turn": {"status": "completed", "error": None},
+                        },
+                    }
+                )
+                + "\n",
+            ]
+        ),
+        stdin=FakeStdin(),
+    )
+
+    async def launcher(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        return process
+
+    client = NativeCodexClient(binary="codex", launcher=launcher)
+    progress: list[Any] = []
+    streamed: list[Any] = []
+
+    thread = await client.start_thread(
+        workdir="/tmp/work",
+        model="gpt-5",
+        reasoning_effort="xhigh",
+        permission_mode="safe",
+    )
+    result = await client.run_turn(
+        thread.thread_id,
+        "hello",
+        on_progress=progress.append,
+        on_stream_text=streamed.append,
+    )
+
+    progress_items = [(entry.agent_key, entry.text) for entry in progress]
+    streamed_items = [(entry.agent_key, entry.text) for entry in streamed]
+
+    assert result.exit_code == 0
+    assert result.final_text == "main final"
+    assert streamed_items[0] == ("main", "main planning note")
+    assert (
+        "main",
+        "正在分派子 agent 任务 - Write regression tests for the Telegram bridge",
+    ) in progress_items
+    assert ("agent-1", "运行中（writing tests）") in progress_items
+    assert ("agent-1", "raw child answer") in streamed_items
+    assert ("main", "main final") == streamed_items[-1]
+    assert progress_items[0] == ("main", "开始处理请求")
+    assert ("main", "正在等待子 agent，现已收到结果") in progress_items
+    assert ("agent-1", "已完成（tests ready）") in progress_items
+
+
+@pytest.mark.asyncio
+async def test_native_client_emits_per_agent_updates_for_spawned_subagent() -> None:
+    process = FakeProcess(
+        stdout=FakeStdout(
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {
+                            "thread": {
+                                "id": "thread-main",
+                                "name": "Main Thread",
+                                "updatedAt": "2025-03-01T00:00:00Z",
+                                "cwd": "/tmp/work",
+                                "source": "cli",
+                            }
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps({"jsonrpc": "2.0", "id": 3, "result": {}}) + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "turn/started",
+                        "params": {"threadId": "thread-main"},
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": "thread-main",
+                            "itemId": "msg-main-1",
+                            "delta": "main commentary",
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "thread-main",
+                            "item": {
+                                "id": "collab-1",
+                                "type": "collabAgentToolCall",
+                                "tool": "spawnAgent",
+                                "status": "inProgress",
+                                "senderThreadId": "thread-main",
+                                "receiverThreadIds": ["thread-sub-1"],
+                                "agentsStates": {
+                                    "thread-sub-1": {
+                                        "status": "running",
+                                        "message": "writing tests",
+                                    }
+                                },
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": "thread-sub-1",
+                            "itemId": "msg-sub-1",
+                            "delta": "sub commentary",
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-sub-1",
+                            "item": {
+                                "id": "msg-sub-2",
+                                "type": "agentMessage",
+                                "text": "sub final",
+                                "phase": "final_answer",
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-main",
+                            "item": {
+                                "id": "msg-main-2",
+                                "type": "agentMessage",
+                                "text": "main final",
+                                "phase": "final_answer",
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-main",
+                            "turn": {"status": "completed", "error": None},
+                        },
+                    }
+                )
+                + "\n",
+            ]
+        ),
+        stdin=FakeStdin(),
+    )
+
+    async def launcher(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        return process
+
+    client = NativeCodexClient(binary="codex", launcher=launcher)
+    progress: list[Any] = []
+    streamed: list[Any] = []
+
+    thread = await client.start_thread(
+        workdir="/tmp/work",
+        model="gpt-5",
+        reasoning_effort="xhigh",
+        permission_mode="safe",
+    )
+    result = await client.run_turn(
+        thread.thread_id,
+        "hello",
+        on_progress=progress.append,
+        on_stream_text=streamed.append,
+    )
+
+    assert result.exit_code == 0
+    assert result.final_text == "main final"
+    assert [(entry.agent_key, entry.text) for entry in progress[:2]] == [
+        ("main", "开始处理请求"),
+        ("main", "正在分派子 agent 任务"),
+    ]
+    assert ("thread-sub-1", "运行中（writing tests）") in [
+        (entry.agent_key, entry.text) for entry in progress
+    ]
+    assert ("main", "main commentary") in [
+        (entry.agent_key, entry.text) for entry in streamed
+    ]
+    assert ("thread-sub-1", "sub commentary") in [
+        (entry.agent_key, entry.text) for entry in streamed
+    ]
+    assert ("thread-sub-1", "sub final") in [
+        (entry.agent_key, entry.text) for entry in streamed
+    ]
+    assert streamed[-1].agent_key == "main"
+    assert streamed[-1].text == "main final"
 
 
 @pytest.mark.asyncio

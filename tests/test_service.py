@@ -9,6 +9,7 @@ import pytest
 
 from nonebot_plugin_codex.native_client import NativeThreadSummary
 from nonebot_plugin_codex.service import (
+    _ensure_agent_panel,
     CodexBridgeService,
     CodexBridgeSettings,
     HistoricalSessionSummary,
@@ -195,6 +196,23 @@ def test_default_preferences_use_codex_config_when_model_cache_is_missing(
     assert preferences.model == "gpt-5"
     assert preferences.reasoning_effort == "xhigh"
     assert preferences.workdir == str(tmp_path.resolve())
+
+
+def test_chat_session_tracks_agent_panels_in_creation_order(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    service = make_service(tmp_path, model_cache_file)
+    session = service.get_session("private_1")
+
+    main_panel = _ensure_agent_panel(session, "main")
+    first_sub = _ensure_agent_panel(session, "thread-sub-1")
+    second_sub = _ensure_agent_panel(session, "thread-sub-2")
+
+    assert main_panel.agent_label == "主 agent"
+    assert first_sub.agent_label == "子 agent 1"
+    assert second_sub.agent_label == "子 agent 2"
+    assert session.agent_order == ["main", "thread-sub-1", "thread-sub-2"]
 
 
 def test_directory_browser_home_uses_configured_workdir(

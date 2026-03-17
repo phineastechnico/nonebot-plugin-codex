@@ -168,6 +168,16 @@ class FakeService:
         self.workspace_token = "workspace"
         self.workspace_version = 1
         self.workspace_closed = False
+        self.run_updates: list[tuple[str, Any]] = []
+        self.run_progress_updates: list[Any] = []
+        self.run_stream_updates: list[Any] = []
+        self.run_result = SimpleNamespace(
+            cancelled=False,
+            exit_code=0,
+            final_text="完成",
+            notice="",
+            diagnostics=[],
+        )
 
     def get_session(self, chat_key: str) -> ChatSession:
         return self.session
@@ -195,13 +205,20 @@ class FakeService:
         on_stream_text=None,
     ):  # noqa: ANN001,E501
         self.execute_calls.append((prompt, mode_override))
-        return SimpleNamespace(
-            cancelled=False,
-            exit_code=0,
-            final_text="完成",
-            notice="",
-            diagnostics=[],
-        )
+        if self.run_updates:
+            for kind, update in self.run_updates:
+                if kind == "progress" and on_progress is not None:
+                    await on_progress(update)
+                if kind == "stream" and on_stream_text is not None:
+                    await on_stream_text(update)
+            return self.run_result
+        if on_progress is not None:
+            for update in self.run_progress_updates:
+                await on_progress(update)
+        if on_stream_text is not None:
+            for update in self.run_stream_updates:
+                await on_stream_text(update)
+        return self.run_result
 
     async def reset_chat(self, chat_key: str, *, keep_active: bool) -> ChatSession:
         self.session = ChatSession(active=keep_active)
@@ -491,6 +508,92 @@ async def test_handle_exec_requires_prompt() -> None:
     await handlers.handle_exec(bot, FakeEvent(""), FakeMessage(""))
 
     assert bot.sent[0]["text"] == "请在 /exec 后输入要执行的内容。"
+
+
+@pytest.mark.asyncio
+async def test_execute_prompt_keeps_separate_message_pairs_per_agent() -> None:
+    service = FakeService()
+    service.run_updates = [
+        (
+            "progress",
+            SimpleNamespace(
+                agent_key="main",
+                agent_label="主 agent",
+                text="Codex 运行中…",
+            ),
+        ),
+        (
+            "stream",
+            SimpleNamespace(
+                agent_key="main",
+                agent_label="主 agent",
+                text="主 agent 临时回复",
+            ),
+        ),
+        (
+            "progress",
+            SimpleNamespace(
+                agent_key="thread-sub-1",
+                agent_label="子 agent 1",
+                text="Codex 运行中…",
+            ),
+        ),
+        (
+            "stream",
+            SimpleNamespace(
+                agent_key="thread-sub-1",
+                agent_label="子 agent 1",
+                text="子 agent 临时回复",
+            ),
+        ),
+        (
+            "progress",
+            SimpleNamespace(
+                agent_key="thread-sub-1",
+                agent_label="子 agent 1",
+                text="Codex 运行中…\n- 已完成",
+            ),
+        ),
+        (
+            "stream",
+            SimpleNamespace(
+                agent_key="main",
+                agent_label="主 agent",
+                text="主 agent 最终回复",
+            ),
+        ),
+    ]
+    service.run_result = SimpleNamespace(
+        cancelled=False,
+        exit_code=0,
+        final_text="主 agent 最终回复",
+        notice="",
+        diagnostics=[],
+    )
+    handlers = TelegramHandlers(service)
+    bot = FakeBot()
+
+    await handlers.execute_prompt(bot, FakeEvent(""), "hello")
+
+    assert [payload["text"] for payload in bot.sent[:4]] == [
+        "主 agent\nCodex 运行中…",
+        "主 agent\n主 agent 临时回复",
+        "子 agent 1\nCodex 运行中…",
+        "子 agent 1\n子 agent 临时回复",
+    ]
+    assert any(
+        payload["message_id"] == 1 and payload["text"] == "主 agent\nCodex 已完成。"
+        for payload in bot.edited
+    )
+    assert any(
+        payload["message_id"] == 3
+        and payload["text"] == "子 agent 1\n子 agent 1 已完成。"
+        for payload in bot.edited
+    )
+    assert any(
+        payload["message_id"] == 2 and payload["text"] == "主 agent\n主 agent 最终回复"
+        for payload in bot.edited
+    )
 
 
 @pytest.mark.asyncio

@@ -17,11 +17,18 @@ from dataclasses import field, asdict, dataclass
 
 from nonebot.adapters.telegram.model import InlineKeyboardButton, InlineKeyboardMarkup
 
-from .native_client import NativeCodexClient
+from .native_client import NativeAgentUpdate, NativeCodexClient
 from .protocol_io import NdjsonProcessReader, ProtocolStreamError
 
-ProgressCallback = Callable[[str], Awaitable[None]]
-StreamTextCallback = Callable[[str], Awaitable[None]]
+@dataclass(slots=True)
+class AgentPanelUpdate:
+    agent_key: str
+    agent_label: str
+    text: str
+
+
+ProgressCallback = Callable[[AgentPanelUpdate], Awaitable[None]]
+StreamTextCallback = Callable[[AgentPanelUpdate], Awaitable[None]]
 ProcessLauncher = Callable[..., Awaitable[Any]]
 WhichResolver = Callable[[str], str | None]
 
@@ -107,6 +114,8 @@ class ChatSession:
     runner_task: asyncio.Task[Any] | None = None
     progress_message_id: int | None = None
     stream_message_id: int | None = None
+    agent_order: list[str] = field(default_factory=list)
+    agent_panels: dict[str, AgentPanelState] = field(default_factory=dict)
     last_agent_message: str = ""
     last_stream_text: str = ""
     last_stream_rendered_text: str = ""
@@ -114,6 +123,18 @@ class ChatSession:
     progress_lines: list[str] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
     cancel_requested: bool = False
+
+
+@dataclass(slots=True)
+class AgentPanelState:
+    agent_key: str
+    agent_label: str
+    progress_message_id: int | None = None
+    stream_message_id: int | None = None
+    last_stream_text: str = ""
+    last_stream_rendered_text: str = ""
+    stream_message_truncated: bool = False
+    progress_lines: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -463,6 +484,49 @@ def _append_progress_line(session: ChatSession, line: str, limit: int) -> None:
         del session.progress_lines[:-limit]
 
 
+def _agent_label(session: ChatSession, agent_key: str) -> str:
+    if agent_key == "main":
+        return "主 agent"
+    existing = session.agent_panels.get(agent_key)
+    if existing is not None:
+        return existing.agent_label
+    subagent_count = sum(1 for key in session.agent_order if key != "main") + 1
+    return f"子 agent {subagent_count}"
+
+
+def _ensure_agent_panel(session: ChatSession, agent_key: str) -> AgentPanelState:
+    panel = session.agent_panels.get(agent_key)
+    if panel is not None:
+        return panel
+    panel = AgentPanelState(
+        agent_key=agent_key,
+        agent_label=_agent_label(session, agent_key),
+    )
+    session.agent_panels[agent_key] = panel
+    session.agent_order.append(agent_key)
+    return panel
+
+
+def _reset_agent_panels(session: ChatSession) -> None:
+    session.agent_order.clear()
+    session.agent_panels.clear()
+    _ensure_agent_panel(session, "main")
+
+
+def _ordered_agent_panels(session: ChatSession) -> list[AgentPanelState]:
+    return [
+        session.agent_panels[agent_key]
+        for agent_key in session.agent_order
+        if agent_key in session.agent_panels
+    ]
+
+
+def _append_agent_progress_line(panel: AgentPanelState, line: str, limit: int) -> None:
+    panel.progress_lines.append(line)
+    if len(panel.progress_lines) > limit:
+        del panel.progress_lines[:-limit]
+
+
 def _append_diagnostic(session: ChatSession, line: str, limit: int) -> None:
     session.diagnostics.append(line)
     if len(session.diagnostics) > limit:
@@ -529,6 +593,22 @@ def render_progress_text(session: ChatSession, *, header: str | None = None) -> 
         parts.append("Codex 运行中…")
     else:
         body = "\n".join(f"- {line}" for line in session.progress_lines)
+        parts.append(f"Codex 运行中…\n{body}")
+    return "\n".join(parts)
+
+
+def render_agent_progress_text(
+    panel: AgentPanelState,
+    *,
+    header: str | None = None,
+) -> str:
+    parts: list[str] = []
+    if header:
+        parts.append(header)
+    if not panel.progress_lines:
+        parts.append("Codex 运行中…")
+    else:
+        body = "\n".join(f"- {line}" for line in panel.progress_lines)
         parts.append(f"Codex 运行中…\n{body}")
     return "\n".join(parts)
 
@@ -2342,7 +2422,10 @@ class CodexBridgeService:
         )
 
     def get_session(self, chat_key: str) -> ChatSession:
-        return self.sessions.setdefault(chat_key, ChatSession())
+        session = self.sessions.setdefault(chat_key, ChatSession())
+        if not session.agent_order:
+            _reset_agent_panels(session)
+        return session
 
     def get_preferences(self, chat_key: str) -> ChatPreferences:
         preferences = self.preference_overrides.get(chat_key)
@@ -2771,6 +2854,7 @@ class CodexBridgeService:
         session.runner_task = None
         session.progress_message_id = None
         session.stream_message_id = None
+        _reset_agent_panels(session)
         session.last_agent_message = ""
         session.last_stream_text = ""
         session.last_stream_rendered_text = ""
@@ -2958,7 +3042,13 @@ class CodexBridgeService:
             self._set_exec_thread_id(session, None)
             self._sync_legacy_thread_id(session)
             if on_progress is not None:
-                await on_progress("原会话恢复失败，正在新开会话…")
+                await on_progress(
+                    AgentPanelUpdate(
+                        agent_key="main",
+                        agent_label=_ensure_agent_panel(session, "main").agent_label,
+                        text="原会话恢复失败，正在新开会话…",
+                    )
+                )
             result = await self._run_exec_once(
                 session,
                 prompt,
@@ -2990,6 +3080,9 @@ class CodexBridgeService:
         session.stream_message_truncated = False
         session.progress_lines.clear()
         session.diagnostics.clear()
+        _reset_agent_panels(session)
+        main_panel = _ensure_agent_panel(session, "main")
+        main_panel.progress_lines = session.progress_lines
 
         exec_thread_id = self._current_exec_thread_id(session)
         starting_new_thread = exec_thread_id is None
@@ -3017,12 +3110,16 @@ class CodexBridgeService:
 
         if on_progress is not None:
             await on_progress(
-                render_progress_text(
-                    session,
-                    header=(
-                        format_preferences_summary(preferences)
-                        if starting_new_thread
-                        else None
+                AgentPanelUpdate(
+                    agent_key="main",
+                    agent_label=main_panel.agent_label,
+                    text=render_agent_progress_text(
+                        main_panel,
+                        header=(
+                            format_preferences_summary(preferences)
+                            if starting_new_thread
+                            else None
+                        ),
                     ),
                 )
             )
@@ -3061,9 +3158,22 @@ class CodexBridgeService:
                         self._set_exec_thread_id(session, thread_id)
                         self._sync_legacy_thread_id(session)
                 if changed and on_progress is not None:
-                    await on_progress(render_progress_text(session))
+                    await on_progress(
+                        AgentPanelUpdate(
+                            agent_key="main",
+                            agent_label=main_panel.agent_label,
+                            text=render_agent_progress_text(main_panel),
+                        )
+                    )
                 if stream_text is not None and on_stream_text is not None:
-                    await on_stream_text(stream_text)
+                    main_panel.last_stream_text = stream_text
+                    await on_stream_text(
+                        AgentPanelUpdate(
+                            agent_key="main",
+                            agent_label=main_panel.agent_label,
+                            text=stream_text,
+                        )
+                    )
 
             exit_code = await process.wait()
             cancelled = session.cancel_requested
@@ -3120,33 +3230,58 @@ class CodexBridgeService:
         session.stream_message_truncated = False
         session.progress_lines.clear()
         session.diagnostics.clear()
+        _reset_agent_panels(session)
 
         starting_new_thread = session.native_thread_id is None
         if on_progress is not None:
+            main_panel = _ensure_agent_panel(session, "main")
             await on_progress(
-                render_progress_text(
-                    session,
-                    header=(
-                        format_preferences_summary(preferences)
-                        if starting_new_thread
-                        else None
+                AgentPanelUpdate(
+                    agent_key="main",
+                    agent_label=main_panel.agent_label,
+                    text=render_agent_progress_text(
+                        main_panel,
+                        header=(
+                            format_preferences_summary(preferences)
+                            if starting_new_thread
+                            else None
+                        ),
                     ),
                 )
             )
 
-        async def forward_progress(line: str) -> None:
-            _append_progress_line(session, line, self.settings.progress_history)
+        async def forward_progress(update: NativeAgentUpdate) -> None:
+            panel = _ensure_agent_panel(session, update.agent_key)
+            _append_agent_progress_line(
+                panel,
+                update.text,
+                self.settings.progress_history,
+            )
             if on_progress is not None:
-                await on_progress(render_progress_text(session))
+                await on_progress(
+                    AgentPanelUpdate(
+                        agent_key=panel.agent_key,
+                        agent_label=panel.agent_label,
+                        text=render_agent_progress_text(panel),
+                    )
+                )
 
-        async def forward_stream_text(text: str) -> None:
-            stripped = text.strip()
+        async def forward_stream_text(update: NativeAgentUpdate) -> None:
+            panel = _ensure_agent_panel(session, update.agent_key)
+            stripped = update.text.strip()
             if not stripped:
                 return
-            session.last_agent_message = stripped
-            session.last_stream_text = stripped
+            panel.last_stream_text = stripped
+            if update.agent_key == "main":
+                session.last_stream_text = stripped
             if on_stream_text is not None:
-                await on_stream_text(stripped)
+                await on_stream_text(
+                    AgentPanelUpdate(
+                        agent_key=panel.agent_key,
+                        agent_label=panel.agent_label,
+                        text=stripped,
+                    )
+                )
 
         try:
             if session.native_thread_id is None:
@@ -3179,6 +3314,9 @@ class CodexBridgeService:
             if native_result.final_text.strip():
                 session.last_agent_message = native_result.final_text.strip()
                 session.last_stream_text = native_result.final_text.strip()
+                _ensure_agent_panel(session, "main").last_stream_text = (
+                    native_result.final_text.strip()
+                )
             return RunResult(
                 exit_code=native_result.exit_code,
                 final_text=session.last_agent_message,

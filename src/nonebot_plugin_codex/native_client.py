@@ -9,7 +9,13 @@ from collections.abc import Callable, Awaitable
 
 from .protocol_io import NdjsonProcessReader, ProtocolStreamError
 
-Callback = Callable[[str], object]
+@dataclass(slots=True)
+class NativeAgentUpdate:
+    agent_key: str
+    text: str
+
+
+Callback = Callable[[NativeAgentUpdate], object]
 ProcessLauncher = Callable[..., Awaitable[Any]]
 
 
@@ -59,10 +65,10 @@ def _thread_summary_from_payload(thread: dict[str, Any]) -> NativeThreadSummary:
     )
 
 
-async def _maybe_call(callback: Callback | None, text: str) -> None:
+async def _maybe_call(callback: Callback | None, update: NativeAgentUpdate) -> None:
     if callback is None:
         return
-    result = callback(text)
+    result = callback(update)
     if inspect.isawaitable(result):
         await result
 
@@ -72,6 +78,117 @@ def _trim_progress_command(command: str, limit: int = 120) -> str:
     if len(compact) <= limit:
         return compact
     return f"{compact[: limit - 3]}..."
+
+
+def _trim_progress_text(text: str, limit: int = 80) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[: limit - 3]}..."
+
+
+def _normalize_agent_key(agent_key: object, *, main_thread_id: str) -> str:
+    if not isinstance(agent_key, str) or not agent_key:
+        return "main"
+    return "main" if agent_key == main_thread_id else agent_key
+
+
+def _format_collab_tool_progress(
+    item: dict[str, Any],
+    *,
+    main_thread_id: str,
+    started: bool,
+) -> list[NativeAgentUpdate]:
+    tool = str(item.get("tool") or "")
+    prompt = item.get("prompt")
+    receiver_ids = item.get("receiverThreadIds")
+    agent_states = item.get("agentsStates")
+
+    action_labels = {
+        "spawnAgent": (
+            "正在分派子 agent 任务",
+            "子 agent 任务已分派",
+        ),
+        "sendInput": (
+            "正在向子 agent 发送补充指令",
+            "已向子 agent 发送补充指令",
+        ),
+        "resumeAgent": (
+            "正在恢复子 agent",
+            "已恢复子 agent",
+        ),
+        "wait": (
+            "正在等待子 agent",
+            "正在等待子 agent，现已收到结果",
+        ),
+        "closeAgent": (
+            "正在关闭子 agent",
+            "已关闭子 agent",
+        ),
+    }
+    default_start, default_done = (
+        "正在处理子 agent 协作",
+        "子 agent 协作已更新",
+    )
+    start_text, done_text = action_labels.get(tool, (default_start, default_done))
+    updates = [
+        NativeAgentUpdate(
+            agent_key="main",
+            text=start_text if started else done_text,
+        )
+    ]
+
+    if isinstance(prompt, str) and prompt.strip() and tool in {"spawnAgent", "sendInput"}:
+        updates[0].text = f"{updates[0].text} - {_trim_progress_text(prompt)}"
+
+    status_labels = {
+        "pendingInit": "初始化中",
+        "running": "运行中",
+        "completed": "已完成",
+        "errored": "出错",
+        "shutdown": "已关闭",
+        "notFound": "未找到",
+    }
+
+    ordered_ids: list[str] = []
+    if isinstance(receiver_ids, list):
+        for entry in receiver_ids:
+            if isinstance(entry, str) and entry and entry not in ordered_ids:
+                ordered_ids.append(entry)
+    if isinstance(agent_states, dict):
+        for entry in agent_states:
+            if isinstance(entry, str) and entry and entry not in ordered_ids:
+                ordered_ids.append(entry)
+
+    if not isinstance(agent_states, dict):
+        agent_states = {}
+
+    for agent_id in ordered_ids:
+        state = agent_states.get(agent_id)
+        if not isinstance(state, dict):
+            updates.append(
+                NativeAgentUpdate(
+                    agent_key=_normalize_agent_key(
+                        agent_id,
+                        main_thread_id=main_thread_id,
+                    ),
+                    text="状态未知",
+                )
+            )
+            continue
+        status = status_labels.get(str(state.get("status") or ""), "状态未知")
+        message = state.get("message")
+        line = status
+        if isinstance(message, str) and message.strip():
+            line = f"{line}（{_trim_progress_text(message, 60)}）"
+        updates.append(
+            NativeAgentUpdate(
+                agent_key=_normalize_agent_key(agent_id, main_thread_id=main_thread_id),
+                text=line,
+            )
+        )
+
+    return updates
 
 
 async def _terminate_process(process: Any, timeout: float) -> None:
@@ -185,8 +302,18 @@ class NativeCodexClient:
         on_stream_text: Callback | None = None,
     ) -> NativeRunResult:
         diagnostics: list[str] = []
-        streamed_text = ""
         final_text = ""
+        pending_agent_messages: dict[str, str] = {}
+        last_streamed_text: dict[str, str] = {}
+
+        async def emit_stream_update(agent_key: str, text: str) -> None:
+            if last_streamed_text.get(agent_key) == text:
+                return
+            last_streamed_text[agent_key] = text
+            await _maybe_call(
+                on_stream_text,
+                NativeAgentUpdate(agent_key=agent_key, text=text),
+            )
 
         await self._request(
             "turn/start",
@@ -211,7 +338,10 @@ class NativeCodexClient:
                 continue
 
             if method == "turn/started":
-                await _maybe_call(on_progress, "开始处理请求")
+                await _maybe_call(
+                    on_progress,
+                    NativeAgentUpdate(agent_key="main", text="开始处理请求"),
+                )
                 continue
 
             if method in {"item/started", "item/completed"}:
@@ -219,24 +349,63 @@ class NativeCodexClient:
                 if not isinstance(item, dict):
                     continue
                 item_type = item.get("type")
+                agent_key = _normalize_agent_key(
+                    params.get("threadId"),
+                    main_thread_id=thread_id,
+                )
                 if item_type == "commandExecution":
                     command = _trim_progress_command(str(item.get("command") or ""))
                     prefix = "执行" if method == "item/started" else "完成"
-                    await _maybe_call(on_progress, f"{prefix}: {command}")
+                    await _maybe_call(
+                        on_progress,
+                        NativeAgentUpdate(
+                            agent_key=agent_key,
+                            text=f"{prefix}: {command}",
+                        ),
+                    )
+                    continue
+                if item_type == "collabAgentToolCall":
+                    collab_updates = _format_collab_tool_progress(
+                        item,
+                        main_thread_id=thread_id,
+                        started=method == "item/started",
+                    )
+                    for update in collab_updates:
+                        await _maybe_call(on_progress, update)
                     continue
                 if item_type == "agentMessage":
+                    item_id = item.get("id")
+                    if isinstance(item_id, str) and item_id:
+                        pending_agent_messages.pop(f"{agent_key}:{item_id}", None)
                     text = item.get("text")
                     if isinstance(text, str) and text.strip():
-                        final_text = text.strip()
-                        streamed_text = final_text
-                        await _maybe_call(on_stream_text, final_text)
+                        phase = item.get("phase")
+                        stripped = text.strip()
+                        await emit_stream_update(agent_key, stripped)
+                        if phase != "commentary" and agent_key == "main":
+                            final_text = stripped
                     continue
 
             if method == "item/agentMessage/delta":
+                item_id = params.get("itemId")
                 delta = params.get("delta")
+                agent_key = _normalize_agent_key(
+                    params.get("threadId"),
+                    main_thread_id=thread_id,
+                )
                 if isinstance(delta, str) and delta:
-                    streamed_text += delta
-                    await _maybe_call(on_stream_text, streamed_text)
+                    item_key = (
+                        f"{agent_key}:{item_id}"
+                        if isinstance(item_id, str) and item_id
+                        else f"__legacy__:{agent_key}"
+                    )
+                    pending_agent_messages[item_key] = (
+                        pending_agent_messages.get(item_key, "") + delta
+                    )
+                    await emit_stream_update(
+                        agent_key,
+                        pending_agent_messages[item_key],
+                    )
                 continue
 
             if method == "turn/completed":
@@ -248,6 +417,20 @@ class NativeCodexClient:
                         thread_id=thread_id,
                         diagnostics=diagnostics,
                     )
+                if not final_text and pending_agent_messages:
+                    fallback_key = next(
+                        (
+                            key
+                            for key in reversed(list(pending_agent_messages))
+                            if key.endswith(":main") or key == "__legacy__:main"
+                        ),
+                        None,
+                    )
+                    if fallback_key is not None:
+                        buffered_text = pending_agent_messages[fallback_key].strip()
+                        if buffered_text:
+                            final_text = buffered_text
+                            await emit_stream_update("main", final_text)
                 status = turn.get("status")
                 error = turn.get("error")
                 exit_code = 0 if status == "completed" and error is None else 1
