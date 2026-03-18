@@ -134,6 +134,12 @@ if _runtime_ready:
         block=True,
         rule=handlers.is_workspace_callback,
     )
+    status_callback = on_type(
+        CallbackQueryEvent,
+        priority=10,
+        block=True,
+        rule=handlers.is_status_callback,
+    )
 
     @codex_cmd.handle()
     async def _handle_codex(
@@ -246,6 +252,10 @@ if _runtime_ready:
         bot: Bot, event: CallbackQueryEvent
     ) -> None:
         await handlers.handle_workspace_callback(bot, event)
+
+    @status_callback.handle()
+    async def _handle_status_callback(bot: Bot, event: CallbackQueryEvent) -> None:
+        await handlers.handle_status_callback(bot, event)
 
     @follow_up.handle()
     async def _handle_follow_up(bot: Bot, event: MessageEvent) -> None:

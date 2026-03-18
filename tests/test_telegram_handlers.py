@@ -16,6 +16,7 @@ from nonebot_plugin_codex.service import (
     encode_browser_callback,
     encode_history_callback,
     encode_setting_callback,
+    encode_status_callback,
     encode_workspace_callback,
 )
 
@@ -149,6 +150,15 @@ class FakeService:
         self.onboarding_markup = SimpleNamespace(name="onboarding")
         self.workspace_text = "当前工作台"
         self.workspace_markup = SimpleNamespace(name="workspace")
+        self.status_text = (
+            "当前额度状态\n"
+            "上下文：12,345 / 200,000 tokens\n"
+            "5小时：剩余 52%\n"
+            "5小时刷新时间：03-18 01:24:28\n"
+            "1周：剩余 62%\n"
+            "1周刷新时间：03-24 13:04:30"
+        )
+        self.status_markup = SimpleNamespace(name="status")
         self.default_mode = "resume"
         self.execute_calls: list[tuple[str, str | None]] = []
         self.browser_token = "token"
@@ -170,6 +180,9 @@ class FakeService:
         self.workspace_closed = False
         self.compact_calls: list[str] = []
         self.compact_notice = "已压缩当前 resume 会话上下文。"
+        self.status_token = "status"
+        self.status_version = 1
+        self.status_closed = False
         self.run_updates: list[tuple[str, Any]] = []
         self.run_progress_updates: list[Any] = []
         self.run_stream_updates: list[Any] = []
@@ -434,6 +447,49 @@ class FakeService:
             message_id=1,
         )
 
+    def open_status_panel(self, chat_key: str) -> SimpleNamespace:
+        return SimpleNamespace(token=self.status_token)
+
+    async def render_status_panel(self, chat_key: str) -> tuple[str, Any]:
+        return self.status_text, self.status_markup
+
+    def remember_status_panel_message(
+        self, chat_key: str, token: str, message_id: int | None
+    ) -> None:
+        return None
+
+    def get_status_panel(
+        self,
+        chat_key: str,
+        token: str | None = None,
+        version: int | None = None,
+    ) -> SimpleNamespace:
+        if token is not None and token != self.status_token:
+            raise ValueError("状态面板已失效，请重新执行 /status")
+        if version is not None and version != self.status_version:
+            raise ValueError("状态面板已失效，请重新执行 /status")
+        return SimpleNamespace(
+            token=self.status_token,
+            version=self.status_version,
+            message_id=1,
+        )
+
+    def navigate_status_panel(
+        self,
+        chat_key: str,
+        token: str,
+        version: int,
+        action: str,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            token=self.status_token,
+            version=self.status_version,
+            message_id=1,
+        )
+
+    def close_status_panel(self, chat_key: str, token: str, version: int) -> None:
+        self.status_closed = True
+
 
 def make_real_service(
     tmp_path: Path,
@@ -656,6 +712,52 @@ async def test_execute_prompt_keeps_separate_message_pairs_per_agent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_prompt_does_not_mark_main_panel_completed_without_final_text(
+) -> None:
+    service = FakeService()
+    service.run_updates = [
+        (
+            "progress",
+            SimpleNamespace(
+                agent_key="main",
+                agent_label="主 agent",
+                text="Codex 运行中…",
+            ),
+        ),
+        (
+            "progress",
+            SimpleNamespace(
+                agent_key="thread-sub-1",
+                agent_label="子 agent 1",
+                text="运行中（tests failed）",
+            ),
+        ),
+    ]
+    service.run_result = SimpleNamespace(
+        cancelled=False,
+        exit_code=0,
+        final_text="",
+        notice="",
+        diagnostics=[],
+    )
+    handlers = TelegramHandlers(service)
+    bot = FakeBot()
+
+    await handlers.execute_prompt(bot, FakeEvent(""), "hello")
+
+    assert any(
+        payload["message_id"] == 1
+        and payload["text"] == "🧠 主 agent\nCodex 已完成，但没有返回可展示的最终文本。"
+        for payload in bot.edited
+    )
+    assert not any(
+        payload["message_id"] == 1 and payload["text"] == "🧠 主 agent\nCodex 已完成。"
+        for payload in bot.edited
+    )
+    assert bot.sent[-1]["text"] == "Codex 已完成，但没有返回可展示的最终文本。"
+
+
+@pytest.mark.asyncio
 async def test_send_event_message_uses_html_parse_mode_and_renders_text() -> None:
     handlers = TelegramHandlers(FakeService())
     bot = FakeBot()
@@ -751,16 +853,78 @@ async def test_handle_compact_compacts_current_resume_chat() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("handler_name", ["handle_panel", "handle_status"])
-async def test_panel_and_status_open_workspace_panel(handler_name: str) -> None:
+async def test_handle_panel_opens_workspace_panel() -> None:
     service = FakeService()
     handlers = TelegramHandlers(service)
     bot = FakeBot()
 
-    await getattr(handlers, handler_name)(bot, FakeEvent(""))
+    await handlers.handle_panel(bot, FakeEvent(""))
 
     assert bot.sent[0]["text"] == "当前工作台"
     assert bot.sent[0]["reply_markup"] is service.workspace_markup
+
+
+@pytest.mark.asyncio
+async def test_handle_status_opens_status_panel() -> None:
+    service = FakeService()
+    handlers = TelegramHandlers(service)
+    bot = FakeBot()
+
+    await handlers.handle_status(bot, FakeEvent(""))
+
+    assert bot.sent[0]["text"] == service.status_text
+    assert bot.sent[0]["reply_markup"] is service.status_markup
+
+
+@pytest.mark.asyncio
+async def test_handle_status_callback_refresh_rerenders_panel() -> None:
+    service = FakeService()
+    handlers = TelegramHandlers(service)
+    bot = FakeBot()
+    event = FakeCallbackEvent(
+        encode_status_callback(
+            service.status_token,
+            service.status_version,
+            "refresh",
+        )
+    )
+
+    await handlers.handle_status_callback(bot, event)
+
+    assert bot.edited[0]["text"] == service.status_text
+
+
+@pytest.mark.asyncio
+async def test_handle_status_callback_close_closes_panel() -> None:
+    service = FakeService()
+    handlers = TelegramHandlers(service)
+    bot = FakeBot()
+    event = FakeCallbackEvent(
+        encode_status_callback(
+            service.status_token,
+            service.status_version,
+            "close",
+        )
+    )
+
+    await handlers.handle_status_callback(bot, event)
+
+    assert service.status_closed is True
+    assert bot.edited[0]["text"] == "状态面板已关闭。"
+    assert bot.answered[0]["text"] == "已关闭。"
+
+
+@pytest.mark.asyncio
+async def test_handle_status_callback_rejects_stale_payload() -> None:
+    handlers = TelegramHandlers(FakeService())
+    bot = FakeBot()
+
+    await handlers.handle_status_callback(
+        bot, FakeCallbackEvent("cst:stale:1:refresh")
+    )
+
+    assert bot.answered[0]["text"] == "状态面板已失效，请重新执行 /status"
+    assert bot.answered[0]["show_alert"] is True
 
 
 @pytest.mark.asyncio

@@ -15,7 +15,14 @@ class NativeAgentUpdate:
     text: str
 
 
-Callback = Callable[[NativeAgentUpdate], object]
+@dataclass(slots=True)
+class NativeTokenUsage:
+    total_tokens: int
+    model_context_window: int | None = None
+
+
+Callback = Callable[[Any], object]
+TokenUsageCallback = Callable[[NativeTokenUsage], object]
 ProcessLauncher = Callable[..., Awaitable[Any]]
 
 
@@ -65,7 +72,7 @@ def _thread_summary_from_payload(thread: dict[str, Any]) -> NativeThreadSummary:
     )
 
 
-async def _maybe_call(callback: Callback | None, update: NativeAgentUpdate) -> None:
+async def _maybe_call(callback: Callback | None, update: Any) -> None:
     if callback is None:
         return
     result = callback(update)
@@ -211,7 +218,6 @@ def _format_collab_tool_progress(
 
     return updates
 
-
 async def _terminate_process(process: Any, timeout: float) -> None:
     if process is None:
         return
@@ -321,10 +327,12 @@ class NativeCodexClient:
         reasoning_effort: str | None = None,
         on_progress: Callback | None = None,
         on_stream_text: Callback | None = None,
+        on_token_usage: TokenUsageCallback | None = None,
     ) -> NativeRunResult:
         diagnostics: list[str] = []
         final_text = ""
         pending_agent_messages: dict[str, str] = {}
+        pending_agent_message_phases: dict[str, str | None] = {}
         last_streamed_text: dict[str, str] = {}
         last_compaction_notice: dict[str, str] = {}
 
@@ -414,15 +422,30 @@ class NativeCodexClient:
                     continue
                 if item_type == "agentMessage":
                     item_id = item.get("id")
-                    if isinstance(item_id, str) and item_id:
-                        pending_agent_messages.pop(f"{agent_key}:{item_id}", None)
+                    phase = item.get("phase")
+                    item_key = (
+                        f"{agent_key}:{item_id}"
+                        if isinstance(item_id, str) and item_id
+                        else None
+                    )
+                    if item_key is not None:
+                        pending_agent_message_phases[item_key] = (
+                            phase if isinstance(phase, str) else None
+                        )
+                    if (
+                        method == "item/completed"
+                        and isinstance(item_id, str)
+                        and item_id
+                    ):
+                        pending_agent_messages.pop(item_key, None)
+                        pending_agent_message_phases.pop(item_key, None)
                     text = item.get("text")
                     if isinstance(text, str) and text.strip():
-                        phase = item.get("phase")
                         stripped = text.strip()
                         await emit_stream_update(agent_key, stripped)
-                        if phase != "commentary" and agent_key == "main":
-                            final_text = stripped
+                        if phase != "commentary":
+                            if agent_key == "main":
+                                final_text = stripped
                     continue
 
             if method == "item/agentMessage/delta":
@@ -454,9 +477,44 @@ class NativeCodexClient:
                 )
                 notice = _extract_compaction_notice(params) or "已压缩较早对话上下文。"
                 await emit_compaction_notice(agent_key, notice)
+
+            if method == "thread/tokenUsage/updated":
+                agent_key = _normalize_agent_key(
+                    params.get("threadId"),
+                    main_thread_id=thread_id,
+                )
+                if agent_key != "main":
+                    continue
+                token_usage = params.get("tokenUsage")
+                if not isinstance(token_usage, dict):
+                    continue
+                total = token_usage.get("total")
+                total_tokens = (
+                    total.get("totalTokens") if isinstance(total, dict) else None
+                )
+                model_context_window = token_usage.get("modelContextWindow")
+                if not isinstance(total_tokens, int):
+                    continue
+                if model_context_window is not None and not isinstance(
+                    model_context_window, int
+                ):
+                    model_context_window = None
+                await _maybe_call(
+                    on_token_usage,
+                    NativeTokenUsage(
+                        total_tokens=total_tokens,
+                        model_context_window=model_context_window,
+                    ),
+                )
                 continue
 
             if method == "turn/completed":
+                completed_agent_key = _normalize_agent_key(
+                    params.get("threadId"),
+                    main_thread_id=thread_id,
+                )
+                if completed_agent_key != "main":
+                    continue
                 turn = params.get("turn")
                 if not isinstance(turn, dict):
                     return NativeRunResult(
@@ -470,10 +528,14 @@ class NativeCodexClient:
                         (
                             key
                             for key in reversed(list(pending_agent_messages))
-                            if key.endswith(":main") or key == "__legacy__:main"
+                            if key.startswith("main:") or key == "__legacy__:main"
                         ),
                         None,
                     )
+                    if fallback_key is not None:
+                        fallback_phase = pending_agent_message_phases.get(fallback_key)
+                        if fallback_phase == "commentary":
+                            fallback_key = None
                     if fallback_key is not None:
                         buffered_text = pending_agent_messages[fallback_key].strip()
                         if buffered_text:
@@ -579,6 +641,13 @@ class NativeCodexClient:
             cursor = next_cursor
 
         return threads
+
+    async def read_rate_limits(self) -> dict[str, Any]:
+        result = await self._request("account/rateLimits/read", {})
+        snapshot = result.get("rateLimits")
+        if not isinstance(snapshot, dict):
+            raise RuntimeError("account/rateLimits/read 缺少 rateLimits 响应。")
+        return snapshot
 
     def _permission_params(self, permission_mode: str) -> dict[str, str]:
         if permission_mode == "safe":

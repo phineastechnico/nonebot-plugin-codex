@@ -32,6 +32,17 @@ When the plugin uses the native `codex app-server` lane and Codex delegates work
 - The native client forwarded all `agentMessage` deltas and completed texts without checking `phase`.
 - Commentary text could therefore appear in the stream/final reply path.
 - Collaboration tool calls were ignored, so the Telegram progress panel lacked main-agent/subagent context.
+- In follow-up testing, main-agent final text could still be lost when it only existed in
+  `item/agentMessage/delta` frames, because the native fallback looked up the wrong
+  buffered key on `turn/completed`.
+- Another follow-up issue appeared after multi-agent support landed: the native runner
+  treated any `turn/completed` as the end of the active run, including subagent turns.
+  That could bind later follow-up prompts to the subagent thread instead of the main
+  thread, and it also made the bridge vulnerable to leaking subagent result text into
+  the main-agent final-answer path.
+- When that happened, Telegram could still finalize the main progress panel as
+  `Codex 已完成。`, then separately send `Codex 已完成，但没有返回可展示的最终文本。`,
+  which made successful-looking runs appear to stop right after a subagent failure.
 
 ## Affected Modules
 
@@ -48,3 +59,10 @@ When the plugin uses the native `codex app-server` lane and Codex delegates work
   - final-answer `agentMessage`
 - Confirm that only the final answer reaches `on_stream_text`.
 - Confirm that progress updates mention both the main agent and the subagent state.
+- Add a native-client regression where a subagent reports `errored` but the main agent
+  still produces a final answer through delta-only fallback.
+- Add a native-client regression where a subagent emits its own `turn/completed`
+  before the main thread finishes, and confirm the client waits for the main
+  `turn/completed` before returning or updating the stored thread id.
+- Confirm that Telegram uses `Codex 已完成，但没有返回可展示的最终文本。` for the main
+  progress panel instead of a plain `Codex 已完成。` when no final text is available.

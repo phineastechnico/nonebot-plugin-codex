@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 import sys
 
@@ -18,15 +19,30 @@ from nonebot_plugin_codex.service import (
 
 
 class DummyNativeClient:
-    def __init__(self, threads: list[NativeThreadSummary] | None = None) -> None:
+    def __init__(
+        self,
+        threads: list[NativeThreadSummary] | None = None,
+        *,
+        rate_limits: dict[str, object] | None = None,
+        rate_limit_error: Exception | None = None,
+    ) -> None:
         self._threads = threads or []
         self.compact_calls: list[str] = []
         self.compact_notice = "已压缩当前 resume 会话上下文。"
         self.resume_calls: list[str] = []
         self.require_resume_before_compact = False
+        self.rate_limits = rate_limits
+        self.rate_limit_error = rate_limit_error
 
     def clone(self) -> DummyNativeClient:
-        return self
+        clone = DummyNativeClient(
+            list(self._threads),
+            rate_limits=self.rate_limits,
+            rate_limit_error=self.rate_limit_error,
+        )
+        clone.compact_notice = self.compact_notice
+        clone.require_resume_before_compact = self.require_resume_before_compact
+        return clone
 
     async def close(self, timeout: float = 5.0) -> None:
         return None
@@ -58,12 +74,21 @@ class DummyNativeClient:
         self.compact_calls.append(thread_id)
         return self.compact_notice
 
+    async def read_rate_limits(self) -> dict[str, object]:
+        if self.rate_limit_error is not None:
+            raise self.rate_limit_error
+        if self.rate_limits is None:
+            raise RuntimeError("rate limits unavailable")
+        return self.rate_limits
+
 
 def make_service(
     tmp_path: Path,
     model_cache_file: Path,
     *,
     threads: list[NativeThreadSummary] | None = None,
+    rate_limits: dict[str, object] | None = None,
+    rate_limit_error: Exception | None = None,
     launcher=None,
     stream_read_limit: int = 1024 * 1024,
 ) -> CodexBridgeService:
@@ -84,7 +109,11 @@ def make_service(
             archived_sessions_dir=tmp_path / ".codex" / "archived_sessions",
         ),
         launcher=launcher,
-        native_client=DummyNativeClient(threads),
+        native_client=DummyNativeClient(
+            threads,
+            rate_limits=rate_limits,
+            rate_limit_error=rate_limit_error,
+        ),
         which_resolver=lambda _: "/usr/bin/codex",
     )
 
@@ -224,6 +253,112 @@ def test_default_preferences_use_codex_config_when_model_cache_is_missing(
     assert preferences.model == "gpt-5"
     assert preferences.reasoning_effort == "xhigh"
     assert preferences.workdir == str(tmp_path.resolve())
+
+
+@pytest.mark.asyncio
+async def test_render_status_panel_shows_rate_limit_summary(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    primary_resets_at = int(
+        (datetime.now().astimezone() + timedelta(hours=2, minutes=5)).timestamp()
+    )
+    secondary_resets_at = int(
+        (datetime.now().astimezone() + timedelta(days=3, hours=4)).timestamp()
+    )
+    service = make_service(
+        tmp_path,
+        model_cache_file,
+        rate_limits={
+            "limitId": "codex",
+            "primary": {
+                "usedPercent": 48,
+                "windowDurationMins": 300,
+                "resetsAt": primary_resets_at,
+            },
+            "secondary": {
+                "usedPercent": 38,
+                "windowDurationMins": 10080,
+                "resetsAt": secondary_resets_at,
+            },
+        },
+    )
+    session = service.get_session("private_1")
+    session.context_used_tokens = 12345
+    session.context_window_tokens = 200000
+
+    panel = service.open_status_panel("private_1")
+    text, markup = await service.render_status_panel("private_1")
+    primary_reset_text = service._format_status_reset_time(primary_resets_at)  # noqa: SLF001
+    secondary_reset_text = service._format_status_reset_time(secondary_resets_at)  # noqa: SLF001
+
+    assert "当前额度状态" in text
+    assert "上午窗口" not in text
+    assert "下午窗口" not in text
+    assert "上下文：12,345 / 200,000 tokens" in text
+    assert "5小时：剩余 52%" in text
+    assert f"5小时刷新时间：{primary_reset_text}" in text
+    assert "1周：剩余 62%" in text
+    assert f"1周刷新时间：{secondary_reset_text}" in text
+    assert markup.inline_keyboard[0][0].text == "刷新"
+    assert markup.inline_keyboard[0][0].callback_data == (
+        f"cst:{panel.token}:{panel.version}:refresh"
+    )
+    assert markup.inline_keyboard[0][1].text == "关闭"
+
+
+@pytest.mark.asyncio
+async def test_render_status_panel_degrades_cleanly_when_rate_limits_unavailable(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    service = make_service(
+        tmp_path,
+        model_cache_file,
+        rate_limit_error=RuntimeError("Codex app-server 请求失败。"),
+    )
+
+    service.open_status_panel("private_1")
+    text, _markup = await service.render_status_panel("private_1")
+
+    assert "当前额度状态" in text
+    assert "上下文：暂不可用" in text
+    assert "额度状态：暂不可用" in text
+    assert "Codex app-server 请求失败。" in text
+
+
+@pytest.mark.asyncio
+async def test_reset_chat_clears_status_context_usage(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    service = make_service(tmp_path, model_cache_file)
+    session = service.get_session("private_1")
+    session.context_used_tokens = 12345
+    session.context_window_tokens = 200000
+
+    await service.reset_chat("private_1", keep_active=False)
+
+    assert session.context_used_tokens is None
+    assert session.context_window_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_update_workdir_clears_status_context_usage(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    service = make_service(tmp_path, model_cache_file)
+    session = service.get_session("private_1")
+    session.context_used_tokens = 12345
+    session.context_window_tokens = 200000
+    target = tmp_path / "workspace"
+    target.mkdir()
+
+    await service.update_workdir("private_1", str(target))
+
+    assert session.context_used_tokens is None
+    assert session.context_window_tokens is None
 
 
 def test_chat_session_tracks_agent_panels_in_creation_order(

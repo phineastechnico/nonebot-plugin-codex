@@ -17,7 +17,7 @@ from dataclasses import field, asdict, dataclass
 
 from nonebot.adapters.telegram.model import InlineKeyboardButton, InlineKeyboardMarkup
 
-from .native_client import NativeAgentUpdate, NativeCodexClient
+from .native_client import NativeAgentUpdate, NativeCodexClient, NativeTokenUsage
 from .protocol_io import NdjsonProcessReader, ProtocolStreamError
 
 @dataclass(slots=True)
@@ -50,6 +50,8 @@ ONBOARDING_CALLBACK_PREFIX = "cop"
 ONBOARDING_STALE_MESSAGE = "引导面板已失效，请重新执行 /codex"
 WORKSPACE_CALLBACK_PREFIX = "cwp"
 WORKSPACE_STALE_MESSAGE = "工作台面板已失效，请重新执行 /panel"
+STATUS_CALLBACK_PREFIX = "cst"
+STATUS_STALE_MESSAGE = "状态面板已失效，请重新执行 /status"
 
 
 @dataclass(slots=True)
@@ -123,6 +125,8 @@ class ChatSession:
     progress_lines: list[str] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
     cancel_requested: bool = False
+    context_used_tokens: int | None = None
+    context_window_tokens: int | None = None
 
 
 @dataclass(slots=True)
@@ -232,6 +236,14 @@ class OnboardingPanelState:
 
 @dataclass(slots=True)
 class WorkspacePanelState:
+    chat_key: str
+    token: str
+    version: int
+    message_id: int | None = None
+
+
+@dataclass(slots=True)
+class StatusPanelState:
     chat_key: str
     token: str
     version: int
@@ -402,6 +414,22 @@ def decode_workspace_callback(payload: str) -> tuple[str, int, str]:
         version = int(parts[2])
     except ValueError as exc:
         raise ValueError("无效的工作台回调。") from exc
+    return token, version, parts[3]
+
+
+def encode_status_callback(token: str, version: int, action: str) -> str:
+    return f"{STATUS_CALLBACK_PREFIX}:{token}:{version}:{action}"
+
+
+def decode_status_callback(payload: str) -> tuple[str, int, str]:
+    parts = payload.split(":")
+    if len(parts) != 4 or parts[0] != STATUS_CALLBACK_PREFIX:
+        raise ValueError("无效的状态回调。")
+    token = parts[1]
+    try:
+        version = int(parts[2])
+    except ValueError as exc:
+        raise ValueError("无效的状态回调。") from exc
     return token, version, parts[3]
 
 
@@ -647,6 +675,7 @@ class CodexBridgeService:
         self.setting_panels: dict[str, SettingPanelState] = {}
         self.onboarding_panels: dict[str, OnboardingPanelState] = {}
         self.workspace_panels: dict[str, WorkspacePanelState] = {}
+        self.status_panels: dict[str, StatusPanelState] = {}
         self._native_history_entries: list[HistoricalSessionSummary] = []
         self._native_history_loaded = False
         self._history_log_cache: dict[str, HistoryLogCacheEntry] = {}
@@ -794,6 +823,36 @@ class CodexBridgeService:
         if parsed is None:
             return value
         return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _format_status_reset_time(self, value: object) -> str:
+        if not isinstance(value, (int, float)):
+            return "未知"
+        try:
+            parsed = datetime.fromtimestamp(value, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return "未知"
+        return parsed.astimezone().strftime("%m-%d %H:%M:%S")
+
+    def _format_status_bucket_label(self, bucket: object, fallback: str) -> str:
+        if not isinstance(bucket, dict):
+            return fallback
+        window_minutes = bucket.get("windowDurationMins")
+        if window_minutes == 300:
+            return "5小时"
+        if window_minutes == 10080:
+            return "1周"
+        if isinstance(window_minutes, int) and window_minutes > 0:
+            if window_minutes % (60 * 24 * 7) == 0:
+                weeks = window_minutes // (60 * 24 * 7)
+                return f"{weeks}周"
+            if window_minutes % (60 * 24) == 0:
+                days = window_minutes // (60 * 24)
+                return f"{days}天"
+            if window_minutes % 60 == 0:
+                hours = window_minutes // 60
+                return f"{hours}小时"
+            return f"{window_minutes}分钟"
+        return fallback
 
     def _is_noise_history_text(self, text: str) -> bool:
         lowered = text.strip().lower()
@@ -1849,9 +1908,28 @@ class CodexBridgeService:
         self.workspace_panels[chat_key] = state
         return state
 
+    def _replace_status_panel_state(
+        self,
+        chat_key: str,
+        *,
+        previous: StatusPanelState | None = None,
+    ) -> StatusPanelState:
+        state = StatusPanelState(
+            chat_key=chat_key,
+            token=previous.token if previous else self._make_browser_token(),
+            version=(previous.version + 1) if previous else 1,
+            message_id=previous.message_id if previous else None,
+        )
+        self.status_panels[chat_key] = state
+        return state
+
     def open_workspace_panel(self, chat_key: str) -> WorkspacePanelState:
         self.get_preferences(chat_key)
         return self._replace_workspace_panel_state(chat_key)
+
+    def open_status_panel(self, chat_key: str) -> StatusPanelState:
+        self.get_preferences(chat_key)
+        return self._replace_status_panel_state(chat_key)
 
     def get_workspace_panel(
         self,
@@ -1878,6 +1956,36 @@ class CodexBridgeService:
             return
         panel = self.get_workspace_panel(chat_key, token=token)
         panel.message_id = message_id
+
+    def get_status_panel(
+        self,
+        chat_key: str,
+        token: str | None = None,
+        version: int | None = None,
+    ) -> StatusPanelState:
+        state = self.status_panels.get(chat_key)
+        if state is None:
+            raise ValueError(STATUS_STALE_MESSAGE)
+        if token is not None and state.token != token:
+            raise ValueError(STATUS_STALE_MESSAGE)
+        if version is not None and state.version != version:
+            raise ValueError(STATUS_STALE_MESSAGE)
+        return state
+
+    def remember_status_panel_message(
+        self,
+        chat_key: str,
+        token: str,
+        message_id: int | None,
+    ) -> None:
+        if message_id is None:
+            return
+        panel = self.get_status_panel(chat_key, token=token)
+        panel.message_id = message_id
+
+    def close_status_panel(self, chat_key: str, token: str, version: int) -> None:
+        self.get_status_panel(chat_key, token=token, version=version)
+        self.status_panels.pop(chat_key, None)
 
     def close_workspace_panel(self, chat_key: str, token: str, version: int) -> None:
         self.get_workspace_panel(chat_key, token=token, version=version)
@@ -2019,6 +2127,96 @@ class CodexBridgeService:
                     ),
                 ),
             ],
+        ]
+        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+    def navigate_status_panel(
+        self,
+        chat_key: str,
+        token: str,
+        version: int,
+        action: str,
+    ) -> StatusPanelState:
+        panel = self.get_status_panel(chat_key, token=token, version=version)
+        if action != "refresh":
+            raise ValueError("未知状态面板操作。")
+        return self._replace_status_panel_state(chat_key, previous=panel)
+
+    def _format_status_context_line(self, session: ChatSession | None) -> str:
+        if session is None:
+            return "上下文：暂不可用"
+        used_tokens = session.context_used_tokens
+        window_tokens = session.context_window_tokens
+        if not isinstance(used_tokens, int) or not isinstance(window_tokens, int):
+            return "上下文：暂不可用"
+        return f"上下文：{used_tokens:,} / {window_tokens:,} tokens"
+
+    def _format_status_rate_limit_bucket(
+        self,
+        bucket: object,
+        fallback_label: str,
+    ) -> list[str]:
+        label = self._format_status_bucket_label(bucket, fallback_label)
+        if not isinstance(bucket, dict):
+            return [f"{label}：暂不可用", f"{label} 刷新时间：未知"]
+
+        used_percent = bucket.get("usedPercent")
+        if not isinstance(used_percent, int):
+            return [f"{label}：暂不可用", f"{label} 刷新时间：未知"]
+
+        used_percent = max(0, min(used_percent, 100))
+        remaining_percent = max(0, 100 - used_percent)
+        return [
+            f"{label}：剩余 {remaining_percent}%",
+            f"{label}刷新时间：{self._format_status_reset_time(bucket.get('resetsAt'))}",
+        ]
+
+    async def render_status_panel(
+        self, chat_key: str
+    ) -> tuple[str, InlineKeyboardMarkup]:
+        panel = self.get_status_panel(chat_key)
+        lines = [
+            "当前额度状态",
+            self._format_status_context_line(self.sessions.get(chat_key)),
+        ]
+
+        runner = self._spawn_native_client()
+        try:
+            if runner is None:
+                raise RuntimeError("当前环境未启用 Codex app-server 额度查询。")
+            limits = await runner.read_rate_limits()
+            lines.extend(
+                self._format_status_rate_limit_bucket(
+                    limits.get("primary"),
+                    "额度 1",
+                )
+            )
+            lines.extend(
+                self._format_status_rate_limit_bucket(
+                    limits.get("secondary"),
+                    "额度 2",
+                )
+            )
+        except Exception as exc:
+            lines.extend(["额度状态：暂不可用", str(exc) or "未知错误。"])
+        finally:
+            await self._close_native_runner(runner)
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    text="刷新",
+                    callback_data=encode_status_callback(
+                        panel.token, panel.version, "refresh"
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="关闭",
+                    callback_data=encode_status_callback(
+                        panel.token, panel.version, "close"
+                    ),
+                ),
+            ]
         ]
         return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -2487,12 +2685,17 @@ class CodexBridgeService:
         if session.active_mode == "resume":
             session.thread_id = thread_id
 
+    def _clear_status_context_usage(self, session: ChatSession) -> None:
+        session.context_used_tokens = None
+        session.context_window_tokens = None
+
     def _clear_thread_only(self, chat_key: str) -> None:
         session = self.get_session(chat_key)
         session.native_thread_id = None
         session.thread_id = None
         session.exec_thread_id = None
         session.strict_resume = False
+        self._clear_status_context_usage(session)
 
     def _browser_total_pages(self, entries: list[DirectoryEntry]) -> int:
         return max(1, (len(entries) + BROWSER_PAGE_SIZE - 1) // BROWSER_PAGE_SIZE)
@@ -2876,6 +3079,7 @@ class CodexBridgeService:
         session.exec_thread_id = None
         session.thread_id = None
         session.strict_resume = False
+        self._clear_status_context_usage(session)
         session.running = False
         session.process = None
         session.native_runner = None
@@ -3336,6 +3540,10 @@ class CodexBridgeService:
                 reasoning_effort=preferences.reasoning_effort,
                 on_progress=forward_progress,
                 on_stream_text=forward_stream_text,
+                on_token_usage=lambda update: self._apply_token_usage_update(
+                    session,
+                    update,
+                ),
             )
             final_thread_id = native_result.thread_id or thread.thread_id
             self._set_native_thread_id(session, final_thread_id)
@@ -3373,3 +3581,11 @@ class CodexBridgeService:
             session.native_runner = None
             session.runner_task = None
             session.cancel_requested = False
+
+    def _apply_token_usage_update(
+        self,
+        session: ChatSession,
+        update: NativeTokenUsage,
+    ) -> None:
+        session.context_used_tokens = update.total_tokens
+        session.context_window_tokens = update.model_context_window
