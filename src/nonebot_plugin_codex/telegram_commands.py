@@ -35,7 +35,7 @@ TELEGRAM_COMMAND_SPECS: tuple[TelegramCommandSpec, ...] = (
     ),
     TelegramCommandSpec(
         name="status",
-        description="打开当前工作台",
+        description="打开额度状态面板",
         usage="/status",
     ),
     TelegramCommandSpec(

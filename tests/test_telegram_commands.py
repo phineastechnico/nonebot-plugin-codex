@@ -34,7 +34,7 @@ def test_build_telegram_commands_uses_expected_order_and_chinese_descriptions() 
         {"command": "help", "description": "打开使用引导面板"},
         {"command": "start", "description": "打开使用引导面板"},
         {"command": "panel", "description": "打开当前工作台"},
-        {"command": "status", "description": "打开当前工作台"},
+        {"command": "status", "description": "打开额度状态面板"},
         {"command": "mode", "description": "查看或切换默认模式"},
         {"command": "exec", "description": "以一次性 exec 模式执行任务"},
         {"command": "new", "description": "新建当前聊天会话"},

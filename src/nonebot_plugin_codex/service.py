@@ -10,7 +10,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from collections.abc import Callable, Awaitable
 from dataclasses import field, asdict, dataclass
@@ -50,6 +50,8 @@ ONBOARDING_CALLBACK_PREFIX = "cop"
 ONBOARDING_STALE_MESSAGE = "引导面板已失效，请重新执行 /codex"
 WORKSPACE_CALLBACK_PREFIX = "cwp"
 WORKSPACE_STALE_MESSAGE = "工作台面板已失效，请重新执行 /panel"
+STATUS_CALLBACK_PREFIX = "cst"
+STATUS_STALE_MESSAGE = "状态面板已失效，请重新执行 /status"
 
 
 @dataclass(slots=True)
@@ -238,6 +240,14 @@ class WorkspacePanelState:
     message_id: int | None = None
 
 
+@dataclass(slots=True)
+class StatusPanelState:
+    chat_key: str
+    token: str
+    version: int
+    message_id: int | None = None
+
+
 def build_chat_key(chat_type: str, chat_id: int) -> str:
     if chat_type == "private":
         return f"private_{chat_id}"
@@ -402,6 +412,22 @@ def decode_workspace_callback(payload: str) -> tuple[str, int, str]:
         version = int(parts[2])
     except ValueError as exc:
         raise ValueError("无效的工作台回调。") from exc
+    return token, version, parts[3]
+
+
+def encode_status_callback(token: str, version: int, action: str) -> str:
+    return f"{STATUS_CALLBACK_PREFIX}:{token}:{version}:{action}"
+
+
+def decode_status_callback(payload: str) -> tuple[str, int, str]:
+    parts = payload.split(":")
+    if len(parts) != 4 or parts[0] != STATUS_CALLBACK_PREFIX:
+        raise ValueError("无效的状态回调。")
+    token = parts[1]
+    try:
+        version = int(parts[2])
+    except ValueError as exc:
+        raise ValueError("无效的状态回调。") from exc
     return token, version, parts[3]
 
 
@@ -647,6 +673,7 @@ class CodexBridgeService:
         self.setting_panels: dict[str, SettingPanelState] = {}
         self.onboarding_panels: dict[str, OnboardingPanelState] = {}
         self.workspace_panels: dict[str, WorkspacePanelState] = {}
+        self.status_panels: dict[str, StatusPanelState] = {}
         self._native_history_entries: list[HistoricalSessionSummary] = []
         self._native_history_loaded = False
         self._history_log_cache: dict[str, HistoryLogCacheEntry] = {}
@@ -1849,9 +1876,28 @@ class CodexBridgeService:
         self.workspace_panels[chat_key] = state
         return state
 
+    def _replace_status_panel_state(
+        self,
+        chat_key: str,
+        *,
+        previous: StatusPanelState | None = None,
+    ) -> StatusPanelState:
+        state = StatusPanelState(
+            chat_key=chat_key,
+            token=previous.token if previous else self._make_browser_token(),
+            version=(previous.version + 1) if previous else 1,
+            message_id=previous.message_id if previous else None,
+        )
+        self.status_panels[chat_key] = state
+        return state
+
     def open_workspace_panel(self, chat_key: str) -> WorkspacePanelState:
         self.get_preferences(chat_key)
         return self._replace_workspace_panel_state(chat_key)
+
+    def open_status_panel(self, chat_key: str) -> StatusPanelState:
+        self.get_preferences(chat_key)
+        return self._replace_status_panel_state(chat_key)
 
     def get_workspace_panel(
         self,
@@ -1878,6 +1924,36 @@ class CodexBridgeService:
             return
         panel = self.get_workspace_panel(chat_key, token=token)
         panel.message_id = message_id
+
+    def get_status_panel(
+        self,
+        chat_key: str,
+        token: str | None = None,
+        version: int | None = None,
+    ) -> StatusPanelState:
+        state = self.status_panels.get(chat_key)
+        if state is None:
+            raise ValueError(STATUS_STALE_MESSAGE)
+        if token is not None and state.token != token:
+            raise ValueError(STATUS_STALE_MESSAGE)
+        if version is not None and state.version != version:
+            raise ValueError(STATUS_STALE_MESSAGE)
+        return state
+
+    def remember_status_panel_message(
+        self,
+        chat_key: str,
+        token: str,
+        message_id: int | None,
+    ) -> None:
+        if message_id is None:
+            return
+        panel = self.get_status_panel(chat_key, token=token)
+        panel.message_id = message_id
+
+    def close_status_panel(self, chat_key: str, token: str, version: int) -> None:
+        self.get_status_panel(chat_key, token=token, version=version)
+        self.status_panels.pop(chat_key, None)
 
     def close_workspace_panel(self, chat_key: str, token: str, version: int) -> None:
         self.get_workspace_panel(chat_key, token=token, version=version)
@@ -2019,6 +2095,77 @@ class CodexBridgeService:
                     ),
                 ),
             ],
+        ]
+        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+    def navigate_status_panel(
+        self,
+        chat_key: str,
+        token: str,
+        version: int,
+        action: str,
+    ) -> StatusPanelState:
+        panel = self.get_status_panel(chat_key, token=token, version=version)
+        if action != "refresh":
+            raise ValueError("未知状态面板操作。")
+        return self._replace_status_panel_state(chat_key, previous=panel)
+
+    async def render_status_panel(
+        self, chat_key: str
+    ) -> tuple[str, InlineKeyboardMarkup]:
+        panel = self.get_status_panel(chat_key)
+        now = datetime.now().astimezone()
+        current_window = "上午窗口" if now.hour < 12 else "下午窗口"
+        lines = ["当前额度状态", f"当前窗口：{current_window}"]
+
+        runner = self._spawn_native_client()
+        try:
+            if runner is None:
+                raise RuntimeError("Native Codex client is not configured.")
+            limits = await runner.read_rate_limits()
+            primary = limits.get("primary")
+            if not isinstance(primary, dict):
+                raise RuntimeError("额度状态响应缺少 primary 字段。")
+
+            used_percent = int(primary.get("usedPercent") or 0)
+            remaining_percent = max(0, 100 - used_percent)
+            resets_at = int(primary.get("resetsAt") or 0)
+            if resets_at > 0:
+                reset_time = datetime.fromtimestamp(resets_at, tz=now.tzinfo)
+            else:
+                reset_time = now
+            delta = max(reset_time - now, timedelta())
+            hours, remainder = divmod(int(delta.total_seconds()), 3600)
+            minutes = remainder // 60
+
+            lines.extend(
+                [
+                    f"已使用：{used_percent}%",
+                    f"剩余：{remaining_percent}%",
+                    f"刷新时间：{reset_time.strftime('%Y-%m-%d %H:%M:%S %z')}",
+                    f"距离刷新：{hours}小时{minutes}分钟",
+                ]
+            )
+        except Exception as exc:
+            lines.extend(["额度状态：暂不可用", str(exc) or "未知错误。"])
+        finally:
+            await self._close_native_runner(runner)
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    text="刷新",
+                    callback_data=encode_status_callback(
+                        panel.token, panel.version, "refresh"
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="关闭",
+                    callback_data=encode_status_callback(
+                        panel.token, panel.version, "close"
+                    ),
+                ),
+            ]
         ]
         return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
 

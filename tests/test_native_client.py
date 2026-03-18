@@ -610,6 +610,378 @@ async def test_native_client_emits_per_agent_updates_for_spawned_subagent() -> N
 
 
 @pytest.mark.asyncio
+async def test_native_client_uses_main_delta_fallback_for_final_text() -> None:
+    process = FakeProcess(
+        stdout=FakeStdout(
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {
+                            "thread": {
+                                "id": "thread-1",
+                                "name": "Thread One",
+                                "updatedAt": "2025-03-01T00:00:00Z",
+                                "cwd": "/tmp/work",
+                                "source": "cli",
+                            }
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps({"jsonrpc": "2.0", "id": 3, "result": {}}) + "\n",
+                json.dumps({"jsonrpc": "2.0", "method": "turn/started", "params": {}})
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": "thread-1",
+                            "itemId": "msg-main-final",
+                            "delta": "main final only from delta",
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turn": {"status": "completed", "error": None},
+                        },
+                    }
+                )
+                + "\n",
+            ]
+        ),
+        stdin=FakeStdin(),
+    )
+
+    async def launcher(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        return process
+
+    client = NativeCodexClient(binary="codex", launcher=launcher)
+
+    thread = await client.start_thread(
+        workdir="/tmp/work",
+        model="gpt-5",
+        reasoning_effort="xhigh",
+        permission_mode="safe",
+    )
+    result = await client.run_turn(thread.thread_id, "hello")
+
+    assert result.exit_code == 0
+    assert result.final_text == "main final only from delta"
+
+
+@pytest.mark.asyncio
+async def test_native_client_keeps_main_final_text_after_subagent_error() -> None:
+    process = FakeProcess(
+        stdout=FakeStdout(
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {
+                            "thread": {
+                                "id": "thread-main",
+                                "name": "Main Thread",
+                                "updatedAt": "2025-03-01T00:00:00Z",
+                                "cwd": "/tmp/work",
+                                "source": "cli",
+                            }
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps({"jsonrpc": "2.0", "id": 3, "result": {}}) + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "turn/started",
+                        "params": {"threadId": "thread-main"},
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-main",
+                            "item": {
+                                "id": "collab-1",
+                                "type": "collabAgentToolCall",
+                                "tool": "wait",
+                                "status": "completed",
+                                "senderThreadId": "thread-main",
+                                "receiverThreadIds": ["thread-sub-1"],
+                                "agentsStates": {
+                                    "thread-sub-1": {
+                                        "status": "errored",
+                                        "message": "tests failed",
+                                    }
+                                },
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": "thread-main",
+                            "itemId": "msg-main-final",
+                            "delta": "main recovered after child failure",
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-main",
+                            "turn": {"status": "completed", "error": None},
+                        },
+                    }
+                )
+                + "\n",
+            ]
+        ),
+        stdin=FakeStdin(),
+    )
+
+    async def launcher(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        return process
+
+    client = NativeCodexClient(binary="codex", launcher=launcher)
+    progress: list[Any] = []
+
+    thread = await client.start_thread(
+        workdir="/tmp/work",
+        model="gpt-5",
+        reasoning_effort="xhigh",
+        permission_mode="safe",
+    )
+    result = await client.run_turn(
+        thread.thread_id,
+        "hello",
+        on_progress=progress.append,
+    )
+
+    assert ("thread-sub-1", "出错（tests failed）") in [
+        (entry.agent_key, entry.text) for entry in progress
+    ]
+    assert result.exit_code == 0
+    assert result.final_text == "main recovered after child failure"
+
+
+@pytest.mark.asyncio
+async def test_native_client_uses_subagent_final_answer_when_main_turn_has_no_final_text(
+) -> None:
+    process = FakeProcess(
+        stdout=FakeStdout(
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {
+                            "thread": {
+                                "id": "thread-main",
+                                "name": "Main Thread",
+                                "updatedAt": "2025-03-01T00:00:00Z",
+                                "cwd": "/tmp/work",
+                                "source": "cli",
+                            }
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps({"jsonrpc": "2.0", "id": 3, "result": {}}) + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "turn/started",
+                        "params": {"threadId": "thread-main"},
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-sub-1",
+                            "item": {
+                                "id": "msg-sub-final",
+                                "type": "agentMessage",
+                                "text": "subagent final answer",
+                                "phase": "final_answer",
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-main",
+                            "item": {
+                                "id": "collab-1",
+                                "type": "collabAgentToolCall",
+                                "tool": "wait",
+                                "status": "completed",
+                                "senderThreadId": "thread-main",
+                                "receiverThreadIds": ["thread-sub-1"],
+                                "agentsStates": {
+                                    "thread-sub-1": {
+                                        "status": "completed",
+                                        "message": "subagent final answer",
+                                    }
+                                },
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-main",
+                            "turn": {"status": "completed", "error": None},
+                        },
+                    }
+                )
+                + "\n",
+            ]
+        ),
+        stdin=FakeStdin(),
+    )
+
+    async def launcher(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        return process
+
+    client = NativeCodexClient(binary="codex", launcher=launcher)
+
+    thread = await client.start_thread(
+        workdir="/tmp/work",
+        model="gpt-5",
+        reasoning_effort="xhigh",
+        permission_mode="safe",
+    )
+    result = await client.run_turn(thread.thread_id, "hello")
+
+    assert result.exit_code == 0
+    assert result.final_text == "subagent final answer"
+
+
+@pytest.mark.asyncio
+async def test_native_client_uses_completed_wait_message_when_no_agent_final_text_exists(
+) -> None:
+    process = FakeProcess(
+        stdout=FakeStdout(
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {
+                            "thread": {
+                                "id": "thread-main",
+                                "name": "Main Thread",
+                                "updatedAt": "2025-03-01T00:00:00Z",
+                                "cwd": "/tmp/work",
+                                "source": "cli",
+                            }
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps({"jsonrpc": "2.0", "id": 3, "result": {}}) + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "turn/started",
+                        "params": {"threadId": "thread-main"},
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-main",
+                            "item": {
+                                "id": "collab-1",
+                                "type": "collabAgentToolCall",
+                                "tool": "wait",
+                                "status": "completed",
+                                "senderThreadId": "thread-main",
+                                "receiverThreadIds": ["thread-sub-1"],
+                                "agentsStates": {
+                                    "thread-sub-1": {
+                                        "status": "completed",
+                                        "message": "tests ready",
+                                    }
+                                },
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-main",
+                            "turn": {"status": "completed", "error": None},
+                        },
+                    }
+                )
+                + "\n",
+            ]
+        ),
+        stdin=FakeStdin(),
+    )
+
+    async def launcher(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        return process
+
+    client = NativeCodexClient(binary="codex", launcher=launcher)
+
+    thread = await client.start_thread(
+        workdir="/tmp/work",
+        model="gpt-5",
+        reasoning_effort="xhigh",
+        permission_mode="safe",
+    )
+    result = await client.run_turn(thread.thread_id, "hello")
+
+    assert result.exit_code == 0
+    assert result.final_text == "tests ready"
+
+
+@pytest.mark.asyncio
 async def test_native_client_reads_large_stdout_frame_without_readline_limit(
     tmp_path: Path,
 ) -> None:
