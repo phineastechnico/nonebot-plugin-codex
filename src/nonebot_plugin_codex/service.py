@@ -2657,12 +2657,17 @@ class CodexBridgeService:
         if session.active_mode == "resume":
             session.thread_id = thread_id
 
+    def _clear_status_context_usage(self, session: ChatSession) -> None:
+        session.context_used_tokens = None
+        session.context_window_tokens = None
+
     def _clear_thread_only(self, chat_key: str) -> None:
         session = self.get_session(chat_key)
         session.native_thread_id = None
         session.thread_id = None
         session.exec_thread_id = None
         session.strict_resume = False
+        self._clear_status_context_usage(session)
 
     def _browser_total_pages(self, entries: list[DirectoryEntry]) -> int:
         return max(1, (len(entries) + BROWSER_PAGE_SIZE - 1) // BROWSER_PAGE_SIZE)
@@ -3046,6 +3051,7 @@ class CodexBridgeService:
         session.exec_thread_id = None
         session.thread_id = None
         session.strict_resume = False
+        self._clear_status_context_usage(session)
         session.running = False
         session.process = None
         session.native_runner = None
