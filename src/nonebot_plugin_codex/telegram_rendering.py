@@ -47,7 +47,7 @@ def _split_table_row(line: str) -> list[str]:
 
 
 def _render_blocks(text: str, tokens: list[str]) -> str:
-    lines = text.splitlines()
+    lines = text.split("\n")
     rendered: list[str] = []
     index = 0
     while index < len(lines):

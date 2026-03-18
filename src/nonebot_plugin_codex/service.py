@@ -250,6 +250,23 @@ class StatusPanelState:
     message_id: int | None = None
 
 
+def _normalize_status_percentage(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        percent = float(value)
+    else:
+        return None
+    if percent < 0:
+        percent = 0.0
+    if percent <= 1:
+        percent *= 100
+    elif percent > 100 and percent <= 10000:
+        percent /= 100
+    percent = max(0.0, min(percent, 100.0))
+    return int(round(percent))
+
+
 def build_chat_key(chat_type: str, chat_id: int) -> str:
     if chat_type == "private":
         return f"private_{chat_id}"
@@ -462,8 +479,10 @@ def chunk_text(text: str, limit: int) -> list[str]:
         split_at = remaining.rfind("\n", 0, limit)
         if split_at <= 0:
             split_at = limit
-        chunks.append(remaining[:split_at].rstrip())
-        remaining = remaining[split_at:].lstrip()
+        else:
+            split_at += 1
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
     return [chunk for chunk in chunks if chunk]
 
 
@@ -473,6 +492,8 @@ def format_result_text(result: RunResult) -> str:
         parts.append(result.notice)
     if result.cancelled:
         parts.append("Codex 已中断。")
+        if result.final_text:
+            parts.append(result.final_text)
     elif result.final_text:
         parts.append(result.final_text)
     elif result.exit_code == 0:
@@ -603,12 +624,11 @@ def _apply_event(
 
     if item_type == "agent_message":
         text = item.get("text")
-        if isinstance(text, str) and text.strip():
-            stripped = text.strip()
-            session.last_agent_message = stripped
-            if stripped != session.last_stream_text:
-                session.last_stream_text = stripped
-                return False, stripped
+        if isinstance(text, str) and text:
+            session.last_agent_message = text
+            if text != session.last_stream_text:
+                session.last_stream_text = text
+                return False, text
         return False, None
 
     return False, None
@@ -2160,11 +2180,10 @@ class CodexBridgeService:
         if not isinstance(bucket, dict):
             return [f"{label}：暂不可用", f"{label} 刷新时间：未知"]
 
-        used_percent = bucket.get("usedPercent")
-        if not isinstance(used_percent, int):
+        used_percent = _normalize_status_percentage(bucket.get("usedPercent"))
+        if used_percent is None:
             return [f"{label}：暂不可用", f"{label} 刷新时间：未知"]
 
-        used_percent = max(0, min(used_percent, 100))
         remaining_percent = max(0, 100 - used_percent)
         return [
             f"{label}：剩余 {remaining_percent}%",
@@ -3500,18 +3519,17 @@ class CodexBridgeService:
 
         async def forward_stream_text(update: NativeAgentUpdate) -> None:
             panel = _ensure_agent_panel(session, update.agent_key)
-            stripped = update.text.strip()
-            if not stripped:
+            if not update.text:
                 return
-            panel.last_stream_text = stripped
+            panel.last_stream_text = update.text
             if update.agent_key == "main":
-                session.last_stream_text = stripped
+                session.last_stream_text = update.text
             if on_stream_text is not None:
                 await on_stream_text(
                     AgentPanelUpdate(
                         agent_key=panel.agent_key,
                         agent_label=panel.agent_label,
-                        text=stripped,
+                        text=update.text,
                     )
                 )
 
@@ -3547,11 +3565,11 @@ class CodexBridgeService:
             )
             final_thread_id = native_result.thread_id or thread.thread_id
             self._set_native_thread_id(session, final_thread_id)
-            if native_result.final_text.strip():
-                session.last_agent_message = native_result.final_text.strip()
-                session.last_stream_text = native_result.final_text.strip()
+            if native_result.final_text:
+                session.last_agent_message = native_result.final_text
+                session.last_stream_text = native_result.final_text
                 _ensure_agent_panel(session, "main").last_stream_text = (
-                    native_result.final_text.strip()
+                    native_result.final_text
                 )
             return RunResult(
                 exit_code=native_result.exit_code,
@@ -3587,5 +3605,5 @@ class CodexBridgeService:
         session: ChatSession,
         update: NativeTokenUsage,
     ) -> None:
-        session.context_used_tokens = update.total_tokens
+        session.context_used_tokens = update.context_tokens
         session.context_window_tokens = update.model_context_window

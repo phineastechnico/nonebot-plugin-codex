@@ -17,7 +17,7 @@ class NativeAgentUpdate:
 
 @dataclass(slots=True)
 class NativeTokenUsage:
-    total_tokens: int
+    context_tokens: int
     model_context_window: int | None = None
 
 
@@ -440,12 +440,11 @@ class NativeCodexClient:
                         pending_agent_messages.pop(item_key, None)
                         pending_agent_message_phases.pop(item_key, None)
                     text = item.get("text")
-                    if isinstance(text, str) and text.strip():
-                        stripped = text.strip()
-                        await emit_stream_update(agent_key, stripped)
+                    if isinstance(text, str) and text:
+                        await emit_stream_update(agent_key, text)
                         if phase != "commentary":
                             if agent_key == "main":
-                                final_text = stripped
+                                final_text = text
                     continue
 
             if method == "item/agentMessage/delta":
@@ -488,12 +487,12 @@ class NativeCodexClient:
                 token_usage = params.get("tokenUsage")
                 if not isinstance(token_usage, dict):
                     continue
-                total = token_usage.get("total")
-                total_tokens = (
-                    total.get("totalTokens") if isinstance(total, dict) else None
+                last = token_usage.get("last")
+                context_tokens = (
+                    last.get("totalTokens") if isinstance(last, dict) else None
                 )
                 model_context_window = token_usage.get("modelContextWindow")
-                if not isinstance(total_tokens, int):
+                if not isinstance(context_tokens, int):
                     continue
                 if model_context_window is not None and not isinstance(
                     model_context_window, int
@@ -502,7 +501,7 @@ class NativeCodexClient:
                 await _maybe_call(
                     on_token_usage,
                     NativeTokenUsage(
-                        total_tokens=total_tokens,
+                        context_tokens=context_tokens,
                         model_context_window=model_context_window,
                     ),
                 )
@@ -537,7 +536,7 @@ class NativeCodexClient:
                         if fallback_phase == "commentary":
                             fallback_key = None
                     if fallback_key is not None:
-                        buffered_text = pending_agent_messages[fallback_key].strip()
+                        buffered_text = pending_agent_messages[fallback_key]
                         if buffered_text:
                             final_text = buffered_text
                             await emit_stream_update("main", final_text)
@@ -604,6 +603,8 @@ class NativeCodexClient:
                     else "已压缩当前 resume 会话上下文。"
                 )
                 await emit_notice(notice)
+                if method == "item/completed":
+                    return notice
                 continue
 
             if method == "thread/compacted":

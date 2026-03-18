@@ -26,6 +26,7 @@ from .service import (
     WORKSPACE_CALLBACK_PREFIX,
     AgentPanelUpdate,
     CodexBridgeService,
+    RunResult,
     chunk_text,
     build_chat_key,
     decode_onboarding_callback,
@@ -43,11 +44,15 @@ RETRY_AFTER_PATTERN = re.compile(r"retry after (\d+(?:\.\d+)?)", re.IGNORECASE)
 PARSE_ENTITIES_ERROR = "can't parse entities"
 # Telegram 在编辑后的文本和按钮都没变化时，会返回这个错误。
 MESSAGE_NOT_MODIFIED_ERROR = "message is not modified"
+STREAM_FLUSH_INTERVAL = 0.5
+CHAT_MESSAGE_INTERVAL = 1.0
 
 
 class TelegramHandlers:
     def __init__(self, service: CodexBridgeService) -> None:
         self.service = service
+        self._chat_message_locks: dict[int, asyncio.Lock] = {}
+        self._chat_message_sent_at: dict[int, float] = {}
 
     def event_chat(self, event: MessageEvent | CallbackQueryEvent) -> Any:
         chat = getattr(event, "chat", None)
@@ -90,23 +95,45 @@ class TelegramHandlers:
             exc
         ).lower()
 
+    def should_ignore_edit_failure(self, exc: Exception) -> bool:
+        return self.is_message_not_modified_error(exc) or isinstance(exc, NetworkError)
+
+    async def run_chat_message_operation(self, chat_id: int, operation):
+        lock = self._chat_message_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            remaining = CHAT_MESSAGE_INTERVAL - (
+                time.monotonic() - self._chat_message_sent_at.get(chat_id, 0.0)
+            )
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            result = await operation()
+            self._chat_message_sent_at[chat_id] = time.monotonic()
+            return result
+
     async def send_event_message(
         self, bot: Bot, event: MessageEvent, text: str, **kwargs: object
     ):
+        chat_id = event.chat.id
         rendered_kwargs = dict(kwargs)
         rendered_kwargs["parse_mode"] = "HTML"
         rendered_text = render_telegram_html(text)
         try:
-            return await self.retry_telegram_call(
-                lambda: bot.send(event, rendered_text, **rendered_kwargs)
+            return await self.run_chat_message_operation(
+                chat_id,
+                lambda: self.retry_telegram_call(
+                    lambda: bot.send(event, rendered_text, **rendered_kwargs)
+                ),
             )
         except Exception as exc:
             if not self.is_parse_entities_error(exc):
                 raise
             plain_kwargs = dict(kwargs)
             plain_kwargs.pop("parse_mode", None)
-            return await self.retry_telegram_call(
-                lambda: bot.send(event, text, **plain_kwargs)
+            return await self.run_chat_message_operation(
+                chat_id,
+                lambda: self.retry_telegram_call(
+                    lambda: bot.send(event, text, **plain_kwargs)
+                ),
             )
 
     async def send_chat_message(
@@ -116,11 +143,14 @@ class TelegramHandlers:
         rendered_kwargs["parse_mode"] = "HTML"
         rendered_text = render_telegram_html(text)
         try:
-            return await self.retry_telegram_call(
-                lambda: bot.send_message(
-                    chat_id=chat_id,
-                    text=rendered_text,
-                    **rendered_kwargs,
+            return await self.run_chat_message_operation(
+                chat_id,
+                lambda: self.retry_telegram_call(
+                    lambda: bot.send_message(
+                        chat_id=chat_id,
+                        text=rendered_text,
+                        **rendered_kwargs,
+                    )
                 )
             )
         except Exception as exc:
@@ -128,8 +158,15 @@ class TelegramHandlers:
                 raise
             plain_kwargs = dict(kwargs)
             plain_kwargs.pop("parse_mode", None)
-            return await self.retry_telegram_call(
-                lambda: bot.send_message(chat_id=chat_id, text=text, **plain_kwargs)
+            return await self.run_chat_message_operation(
+                chat_id,
+                lambda: self.retry_telegram_call(
+                    lambda: bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        **plain_kwargs,
+                    )
+                ),
             )
 
     async def edit_message(
@@ -145,12 +182,15 @@ class TelegramHandlers:
         rendered_kwargs["parse_mode"] = "HTML"
         rendered_text = render_telegram_html(text)
         try:
-            return await self.retry_telegram_call(
-                lambda: bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=rendered_text,
-                    **rendered_kwargs,
+            return await self.run_chat_message_operation(
+                chat_id,
+                lambda: self.retry_telegram_call(
+                    lambda: bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=rendered_text,
+                        **rendered_kwargs,
+                    )
                 )
             )
         except Exception as exc:
@@ -158,12 +198,15 @@ class TelegramHandlers:
                 raise
             plain_kwargs = dict(kwargs)
             plain_kwargs.pop("parse_mode", None)
-            return await self.retry_telegram_call(
-                lambda: bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=text,
-                    **plain_kwargs,
+            return await self.run_chat_message_operation(
+                chat_id,
+                lambda: self.retry_telegram_call(
+                    lambda: bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        **plain_kwargs,
+                    )
                 )
             )
 
@@ -181,6 +224,11 @@ class TelegramHandlers:
             return text
         title = self.format_agent_title(panel)
         return f"{title}\n{text}" if text else title
+
+    def stream_title(self, session, panel: AgentPanelState) -> str | None:
+        if len(session.agent_order) <= 1:
+            return None
+        return self.format_agent_title(panel)
 
     async def refresh_agent_panel_headers(
         self,
@@ -212,11 +260,8 @@ class TelegramHandlers:
             if panel.stream_message_id is not None and panel.last_stream_text:
                 try:
                     rendered_text, truncated = self.render_stream_text(
-                        self.render_agent_panel_text(
-                            session,
-                            panel,
-                            panel.last_stream_text,
-                        )
+                        panel.last_stream_text,
+                        title=self.stream_title(session, panel),
                     )
                     if not rendered_text:
                         continue
@@ -289,11 +334,29 @@ class TelegramHandlers:
                 message_id=panel.progress_message_id,
                 text=text,
             )
-        except Exception:
+        except Exception as exc:
+            if self.should_ignore_edit_failure(exc):
+                return
             message = await self.send_event_message(bot, event, text)
             panel.progress_message_id = getattr(message, "message_id", None)
 
-    def render_stream_text(self, text: str) -> tuple[str, bool]:
+    def render_stream_text(
+        self,
+        text: str,
+        *,
+        title: str | None = None,
+    ) -> tuple[str, bool]:
+        if title:
+            full_text = f"{title}\n{text}" if text else title
+            if len(full_text) <= self.service.settings.chunk_size:
+                return full_text, False
+            body_limit = self.service.settings.chunk_size - len(title) - 1
+            if body_limit <= 0:
+                return title[: self.service.settings.chunk_size], True
+            chunks = chunk_text(text, body_limit)
+            if not chunks:
+                return title, False
+            return f"{title}\n{chunks[-1]}", True
         chunks = chunk_text(text, self.service.settings.chunk_size)
         if not chunks:
             return "", False
@@ -316,8 +379,10 @@ class TelegramHandlers:
         )
         if created_panel and panel.agent_key != "main" and len(session.agent_order) == 2:
             await self.refresh_agent_panel_headers(bot, event, session)
-        text = self.render_agent_panel_text(session, panel, update.text)
-        rendered_text, truncated = self.render_stream_text(text)
+        rendered_text, truncated = self.render_stream_text(
+            update.text,
+            title=self.stream_title(session, panel),
+        )
         if not rendered_text:
             return
         panel.stream_message_truncated = truncated
@@ -331,11 +396,13 @@ class TelegramHandlers:
             try:
                 await self.edit_message(
                     bot,
-                    chat_id=event.chat.id,
-                    message_id=panel.stream_message_id,
-                    text=rendered_text,
-                )
-            except Exception:
+                chat_id=event.chat.id,
+                message_id=panel.stream_message_id,
+                text=rendered_text,
+            )
+            except Exception as exc:
+                if self.should_ignore_edit_failure(exc):
+                    return
                 message = await self.send_event_message(bot, event, rendered_text)
                 panel.stream_message_id = getattr(message, "message_id", None)
         panel.last_stream_rendered_text = rendered_text
@@ -372,6 +439,21 @@ class TelegramHandlers:
     async def send_result(self, bot: Bot, event: MessageEvent, text: str) -> None:
         for chunk in chunk_text(text, self.service.settings.chunk_size):
             await self.send_event_message(bot, event, chunk)
+
+    def collect_stream_text(self, session) -> str:
+        parts: list[str] = []
+        for agent_key in session.agent_order:
+            panel = session.agent_panels.get(agent_key)
+            if panel is None or not panel.last_stream_text:
+                continue
+            parts.append(
+                self.render_agent_panel_text(
+                    session,
+                    panel,
+                    panel.last_stream_text,
+                )
+            )
+        return "\n\n".join(parts)
 
     def error_text(self, exc: Exception) -> str:
         if (
@@ -416,22 +498,48 @@ class TelegramHandlers:
         self.reset_agent_panels(event)
         last_stream_update_at: dict[str, float] = {}
         pending_stream_updates: dict[str, AgentPanelUpdate] = {}
+        scheduled_flushes: dict[str, asyncio.Task[None]] = {}
+        flush_lock = asyncio.Lock()
 
         async def on_progress(update: AgentPanelUpdate) -> None:
             await self.update_progress(bot, event, update)
 
         async def flush_stream_text(agent_key: str | None = None) -> None:
-            keys = [agent_key] if agent_key is not None else list(pending_stream_updates)
-            for key in keys:
-                update = pending_stream_updates.pop(key, None)
-                if update is None:
-                    continue
-                await self.update_stream_text(bot, event, update)
-                last_stream_update_at[key] = time.monotonic()
+            async with flush_lock:
+                keys = (
+                    [agent_key] if agent_key is not None else list(pending_stream_updates)
+                )
+                for key in keys:
+                    update = pending_stream_updates.pop(key, None)
+                    if update is None:
+                        continue
+                    await self.update_stream_text(bot, event, update)
+                    last_stream_update_at[key] = time.monotonic()
+
+        async def delayed_flush(agent_key: str) -> None:
+            try:
+                while True:
+                    remaining = STREAM_FLUSH_INTERVAL - (
+                        time.monotonic() - last_stream_update_at.get(agent_key, 0.0)
+                    )
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                    await flush_stream_text(agent_key)
+                    if agent_key not in pending_stream_updates:
+                        return
+            finally:
+                scheduled_flushes.pop(agent_key, None)
 
         async def on_stream_text(update: AgentPanelUpdate) -> None:
             pending_stream_updates[update.agent_key] = update
-            if time.monotonic() - last_stream_update_at.get(update.agent_key, 0.0) < 0.5:
+            if (
+                time.monotonic() - last_stream_update_at.get(update.agent_key, 0.0)
+                < STREAM_FLUSH_INTERVAL
+            ):
+                if update.agent_key not in scheduled_flushes:
+                    scheduled_flushes[update.agent_key] = asyncio.create_task(
+                        delayed_flush(update.agent_key)
+                    )
                 return
             await flush_stream_text(update.agent_key)
 
@@ -452,7 +560,12 @@ class TelegramHandlers:
             )
             return
 
+        for task in scheduled_flushes.values():
+            task.cancel()
+        if scheduled_flushes:
+            await asyncio.gather(*scheduled_flushes.values(), return_exceptions=True)
         await flush_stream_text()
+        partial_stream_text = self.collect_stream_text(session)
         if result.cancelled:
             for panel in (
                 session.agent_panels[agent_key]
@@ -466,6 +579,18 @@ class TelegramHandlers:
                     agent_label=panel.agent_label,
                     text=f"{panel.agent_label} 已中断。",
                 )
+            cancelled_text = format_result_text(
+                RunResult(
+                    exit_code=result.exit_code,
+                    final_text=partial_stream_text,
+                    thread_id=getattr(result, "thread_id", None),
+                    notice=result.notice,
+                    diagnostics=list(result.diagnostics),
+                    cancelled=True,
+                )
+            )
+            if cancelled_text:
+                await self.send_result(bot, event, cancelled_text)
             return
 
         if result.exit_code == 0:
@@ -495,11 +620,18 @@ class TelegramHandlers:
                 text=panel_status,
             )
         main_panel = session.agent_panels.get("main")
+        final_rendered_text = ""
+        if main_panel is not None and result.final_text:
+            final_rendered_text, _ = self.render_stream_text(
+                result.final_text,
+                title=self.stream_title(session, main_panel),
+            )
         if (
             main_panel is not None
             and
             result.final_text
             and result.final_text == main_panel.last_stream_text
+            and final_rendered_text == main_panel.last_stream_rendered_text
             and not main_panel.stream_message_truncated
         ):
             if result.notice:

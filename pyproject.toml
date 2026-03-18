@@ -1,6 +1,6 @@
 [project]
 name = "nonebot-plugin-codex"
-version = "0.1.5"
+version = "0.1.6"
 description = "Telegram bridge plugin for driving Codex from NoneBot"
 authors = [
     {name = "ttiee", email = "469784630@qq.com"},

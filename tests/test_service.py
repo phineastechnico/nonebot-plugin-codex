@@ -15,6 +15,7 @@ from nonebot_plugin_codex.service import (
     CodexBridgeSettings,
     HistoricalSessionSummary,
     build_exec_argv,
+    chunk_text,
 )
 
 
@@ -233,6 +234,14 @@ def test_build_exec_argv_for_safe_and_resume_mode() -> None:
     assert argv[-2:] == ["thread-1", "hello"]
 
 
+def test_chunk_text_preserves_whitespace_and_newlines() -> None:
+    text = "  foo\n  bar\nbaz  "
+
+    chunks = chunk_text(text, 6)
+
+    assert "".join(chunks) == text
+
+
 def test_default_preferences_use_configured_workdir(
     tmp_path: Path, model_cache_file: Path
 ) -> None:
@@ -305,6 +314,45 @@ async def test_render_status_panel_shows_rate_limit_summary(
         f"cst:{panel.token}:{panel.version}:refresh"
     )
     assert markup.inline_keyboard[0][1].text == "关闭"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("primary_used_percent", "secondary_used_percent"),
+    [
+        (0.48, 0.38),
+        (4800, 3800),
+    ],
+)
+async def test_render_status_panel_normalizes_rate_limit_percent_units(
+    tmp_path: Path,
+    model_cache_file: Path,
+    primary_used_percent: float,
+    secondary_used_percent: float,
+) -> None:
+    service = make_service(
+        tmp_path,
+        model_cache_file,
+        rate_limits={
+            "limitId": "codex",
+            "primary": {
+                "usedPercent": primary_used_percent,
+                "windowDurationMins": 300,
+                "resetsAt": int(datetime.now().astimezone().timestamp()) + 3600,
+            },
+            "secondary": {
+                "usedPercent": secondary_used_percent,
+                "windowDurationMins": 10080,
+                "resetsAt": int(datetime.now().astimezone().timestamp()) + 7200,
+            },
+        },
+    )
+
+    service.open_status_panel("private_1")
+    text, _markup = await service.render_status_panel("private_1")
+
+    assert "5小时：剩余 52%" in text
+    assert "1周：剩余 62%" in text
 
 
 @pytest.mark.asyncio
@@ -870,3 +918,119 @@ async def test_run_prompt_exec_returns_friendly_protocol_error_and_cleans_up(
     assert any("codex_stream_read_limit" in line for line in result.diagnostics)
     assert session.running is False
     assert session.process is None
+
+
+@pytest.mark.asyncio
+async def test_run_prompt_exec_preserves_agent_message_whitespace(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    streamed_text = "  done\n"
+    completed_payload = {
+        "type": "item.completed",
+        "item": {"type": "agent_message", "text": streamed_text},
+    }
+    script = (
+        "import json, sys\n"
+        f"messages = [{completed_payload!r}]\n"
+        "for message in messages:\n"
+        "    sys.stdout.write(json.dumps(message) + '\\n')\n"
+        "    sys.stdout.flush()\n"
+    )
+
+    async def launcher(*_args, **kwargs):
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            script,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=kwargs.get("stderr", asyncio.subprocess.PIPE),
+            limit=int(kwargs.get("limit", 1024)),
+        )
+
+    service = make_service(tmp_path, model_cache_file, launcher=launcher)
+
+    result = await service.run_prompt("private_1", "hello", mode_override="exec")
+
+    assert result.final_text == streamed_text
+
+
+@pytest.mark.asyncio
+async def test_run_prompt_resume_preserves_stream_whitespace(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    streamed_text = "  line 1\n  line 2\n"
+
+    class StreamingNativeClient:
+        def clone(self) -> StreamingNativeClient:
+            return self
+
+        async def close(self, timeout: float = 5.0) -> None:
+            return None
+
+        async def start_thread(
+            self,
+            *,
+            workdir: str,
+            model: str,
+            reasoning_effort: str,
+            permission_mode: str,
+        ) -> NativeThreadSummary:
+            return NativeThreadSummary(
+                thread_id="thread-1",
+                thread_name="Native Session",
+                updated_at="2025-03-01T00:00:00Z",
+                cwd=workdir,
+                source_kind="cli",
+            )
+
+        async def resume_thread(self, *_args, **_kwargs) -> NativeThreadSummary:
+            raise AssertionError("resume_thread should not be called")
+
+        async def run_turn(
+            self,
+            thread_id: str,
+            prompt: str,
+            *,
+            cwd: str,
+            model: str,
+            reasoning_effort: str,
+            on_progress,
+            on_stream_text,
+            on_token_usage,
+        ):
+            await on_stream_text(
+                type(
+                    "NativeUpdate",
+                    (),
+                    {"agent_key": "main", "text": streamed_text},
+                )()
+            )
+            return type(
+                "NativeResult",
+                (),
+                {
+                    "thread_id": thread_id,
+                    "exit_code": 0,
+                    "final_text": streamed_text,
+                    "diagnostics": [],
+                },
+            )()
+
+    service = make_service(tmp_path, model_cache_file)
+    service.native_client = StreamingNativeClient()
+    stream_updates: list[str] = []
+
+    async def capture_stream(update) -> None:  # noqa: ANN001
+        stream_updates.append(update.text)
+
+    result = await service.run_prompt(
+        "private_1",
+        "hello",
+        on_stream_text=capture_stream,
+    )
+
+    assert stream_updates == [streamed_text]
+    assert result.final_text == streamed_text

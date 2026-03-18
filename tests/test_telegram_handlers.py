@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from pathlib import Path
 from typing import Any
 from types import SimpleNamespace
@@ -7,7 +9,7 @@ from dataclasses import field, dataclass
 
 import pytest
 
-from nonebot.adapters.telegram.exception import ActionFailed
+from nonebot.adapters.telegram.exception import ActionFailed, NetworkError
 from nonebot_plugin_codex.telegram import TelegramHandlers
 from nonebot_plugin_codex.service import (
     ChatSession,
@@ -137,6 +139,75 @@ class MessageNotModifiedBot(FakeBot):
             }
         )
         raise ActionFailed("Bad Request: message is not modified")
+
+
+class StreamTrackingBot(FakeBot):
+    def __init__(self, expected_text: str, seen_event: asyncio.Event) -> None:
+        super().__init__()
+        self.expected_text = expected_text
+        self.seen_event = seen_event
+
+    async def send(self, event: FakeEvent, text: str, **kwargs: Any) -> SimpleNamespace:
+        message = await super().send(event, text, **kwargs)
+        if text == self.expected_text:
+            self.seen_event.set()
+        return message
+
+    async def edit_message_text(
+        self, *, chat_id: int, message_id: int, text: str, **kwargs: Any
+    ) -> None:
+        await super().edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            **kwargs,
+        )
+        if text == self.expected_text:
+            self.seen_event.set()
+
+
+class TimedBot(FakeBot):
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_times: list[float] = []
+
+    async def send_message(
+        self, *, chat_id: int, text: str, **kwargs: Any
+    ) -> SimpleNamespace:
+        self.call_times.append(time.monotonic())
+        return await super().send_message(chat_id=chat_id, text=text, **kwargs)
+
+    async def edit_message_text(
+        self, *, chat_id: int, message_id: int, text: str, **kwargs: Any
+    ) -> None:
+        self.call_times.append(time.monotonic())
+        await super().edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            **kwargs,
+        )
+
+
+class NetworkFailingEditBot(FakeBot):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next_edit = True
+
+    async def edit_message_text(
+        self, *, chat_id: int, message_id: int, text: str, **kwargs: Any
+    ) -> None:
+        self.edited.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                **kwargs,
+            }
+        )
+        if self.fail_next_edit:
+            self.fail_next_edit = False
+            raise NetworkError("temporary network jitter")
 
 
 class FakeService:
@@ -709,6 +780,222 @@ async def test_execute_prompt_keeps_separate_message_pairs_per_agent() -> None:
         and payload["text"] == "🧠 主 agent\n主 agent 最终回复"
         for payload in bot.edited
     )
+
+
+@pytest.mark.asyncio
+async def test_execute_prompt_flushes_pending_stream_updates_on_timer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = FakeService()
+    seen_event = asyncio.Event()
+    handlers = TelegramHandlers(service)
+    bot = StreamTrackingBot("abcd", seen_event)
+
+    monkeypatch.setattr("nonebot_plugin_codex.telegram.STREAM_FLUSH_INTERVAL", 0.01)
+    monkeypatch.setattr("nonebot_plugin_codex.telegram.CHAT_MESSAGE_INTERVAL", 0.0)
+
+    async def scripted_run_prompt(
+        chat_key: str,
+        prompt: str,
+        *,
+        mode_override: str | None = None,
+        on_progress=None,
+        on_stream_text=None,
+    ) -> Any:
+        assert chat_key == "private_1"
+        assert prompt == "hello"
+        assert mode_override is None
+        if on_progress is not None:
+            await on_progress(
+                SimpleNamespace(
+                    agent_key="main",
+                    agent_label="主 agent",
+                    text="Codex 运行中…",
+                )
+            )
+        if on_stream_text is not None:
+            await on_stream_text(
+                SimpleNamespace(
+                    agent_key="main",
+                    agent_label="主 agent",
+                    text="a",
+                )
+            )
+            await on_stream_text(
+                SimpleNamespace(
+                    agent_key="main",
+                    agent_label="主 agent",
+                    text="abcd",
+                )
+            )
+            await asyncio.wait_for(seen_event.wait(), timeout=0.1)
+        return SimpleNamespace(
+            cancelled=False,
+            exit_code=0,
+            final_text="abcd",
+            notice="",
+            diagnostics=[],
+        )
+
+    service.run_prompt = scripted_run_prompt
+
+    await handlers.execute_prompt(bot, FakeEvent(""), "hello")
+
+    assert any(
+        payload["message_id"] == 2 and payload["text"] == "abcd"
+        for payload in bot.edited
+    )
+
+
+@pytest.mark.asyncio
+async def test_message_operations_are_rate_limited_per_chat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handlers = TelegramHandlers(FakeService())
+    bot = TimedBot()
+
+    monkeypatch.setattr(
+        "nonebot_plugin_codex.telegram.CHAT_MESSAGE_INTERVAL",
+        0.02,
+    )
+
+    await asyncio.gather(
+        handlers.send_chat_message(bot, 1, "first"),
+        handlers.edit_message(bot, chat_id=1, message_id=1, text="second"),
+    )
+
+    assert len(bot.call_times) == 2
+    assert bot.call_times[1] - bot.call_times[0] >= 0.015
+
+
+@pytest.mark.asyncio
+async def test_update_progress_ignores_message_not_modified_without_duplicate_send(
+) -> None:
+    handlers = TelegramHandlers(FakeService())
+    bot = MessageNotModifiedBot()
+    event = FakeEvent("")
+    update = SimpleNamespace(
+        agent_key="main",
+        agent_label="主 agent",
+        text="Codex 运行中…",
+    )
+
+    await handlers.update_progress(bot, event, update)
+    await handlers.update_progress(bot, event, update)
+
+    assert len(bot.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_update_stream_text_keeps_agent_title_when_truncated() -> None:
+    service = FakeService()
+    service.settings.chunk_size = 18
+    handlers = TelegramHandlers(service)
+    bot = FakeBot()
+    event = FakeEvent("")
+
+    handlers.ensure_agent_panel(event, agent_key="main", agent_label="主 agent")
+    handlers.ensure_agent_panel(
+        event,
+        agent_key="thread-sub-1",
+        agent_label="子 agent 1",
+    )
+
+    await handlers.update_stream_text(
+        bot,
+        event,
+        SimpleNamespace(
+            agent_key="main",
+            agent_label="主 agent",
+            text="0123456789abcdef",
+        ),
+    )
+
+    assert bot.sent[0]["text"].startswith("🧠 主 agent\n")
+
+
+@pytest.mark.asyncio
+async def test_execute_prompt_cancelled_run_sends_full_stream_text() -> None:
+    service = FakeService()
+    service.settings.chunk_size = 12
+    streamed_text = "  alpha\n  beta\n"
+    service.run_updates = [
+        (
+            "progress",
+            SimpleNamespace(
+                agent_key="main",
+                agent_label="主 agent",
+                text="Codex 运行中…",
+            ),
+        ),
+        (
+            "stream",
+            SimpleNamespace(
+                agent_key="main",
+                agent_label="主 agent",
+                text=streamed_text,
+            ),
+        ),
+    ]
+    service.run_result = SimpleNamespace(
+        cancelled=True,
+        exit_code=1,
+        final_text="",
+        notice="",
+        diagnostics=[],
+    )
+    handlers = TelegramHandlers(service)
+    bot = FakeBot()
+
+    await handlers.execute_prompt(bot, FakeEvent(""), "hello")
+
+    assert "".join(payload["text"] for payload in bot.sent[2:]) == (
+        f"Codex 已中断。\n\n{streamed_text}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_prompt_sends_final_text_after_stream_edit_network_error() -> None:
+    service = FakeService()
+    service.run_updates = [
+        (
+            "progress",
+            SimpleNamespace(
+                agent_key="main",
+                agent_label="主 agent",
+                text="Codex 运行中…",
+            ),
+        ),
+        (
+            "stream",
+            SimpleNamespace(
+                agent_key="main",
+                agent_label="主 agent",
+                text="a",
+            ),
+        ),
+        (
+            "stream",
+            SimpleNamespace(
+                agent_key="main",
+                agent_label="主 agent",
+                text="abcd",
+            ),
+        ),
+    ]
+    service.run_result = SimpleNamespace(
+        cancelled=False,
+        exit_code=0,
+        final_text="abcd",
+        notice="",
+        diagnostics=[],
+    )
+    handlers = TelegramHandlers(service)
+    bot = NetworkFailingEditBot()
+
+    await handlers.execute_prompt(bot, FakeEvent(""), "hello")
+
+    assert bot.sent[-1]["text"] == "abcd"
 
 
 @pytest.mark.asyncio
