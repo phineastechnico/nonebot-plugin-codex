@@ -10,12 +10,14 @@ import pytest
 
 from nonebot_plugin_codex.native_client import NativeThreadSummary
 from nonebot_plugin_codex.service import (
+    RunResult,
     _ensure_agent_panel,
     CodexBridgeService,
     CodexBridgeSettings,
     HistoricalSessionSummary,
     build_exec_argv,
     chunk_text,
+    format_result_text,
 )
 
 
@@ -1034,3 +1036,319 @@ async def test_run_prompt_resume_preserves_stream_whitespace(
 
     assert stream_updates == [streamed_text]
     assert result.final_text == streamed_text
+
+
+def test_format_result_text_prefers_friendly_failure_notice() -> None:
+    text = format_result_text(
+        RunResult(
+            exit_code=1,
+            failure_notice=(
+                "Codex 当前额度已用尽，请稍后重试或使用 /status 查看刷新时间。"
+            ),
+            diagnostics=["insufficient_quota"],
+        )
+    )
+
+    assert text == "Codex 当前额度已用尽，请稍后重试或使用 /status 查看刷新时间。"
+
+
+def test_format_result_text_keeps_regular_notice_and_failure_details() -> None:
+    text = format_result_text(
+        RunResult(
+            exit_code=1,
+            notice="原会话未成功恢复，已新开会话。",
+            diagnostics=["boom"],
+        )
+    )
+
+    assert text == "原会话未成功恢复，已新开会话。\n\nCodex 执行失败。\n\nboom"
+
+
+@pytest.mark.asyncio
+async def test_run_prompt_resume_surfaces_quota_exhausted_notice(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    class QuotaFailingNativeClient:
+        def clone(self) -> QuotaFailingNativeClient:
+            return self
+
+        async def close(self, timeout: float = 5.0) -> None:
+            return None
+
+        async def start_thread(
+            self,
+            *,
+            workdir: str,
+            model: str,
+            reasoning_effort: str,
+            permission_mode: str,
+        ) -> NativeThreadSummary:
+            return NativeThreadSummary(
+                thread_id="thread-1",
+                thread_name="Native Session",
+                updated_at="2025-03-01T00:00:00Z",
+                cwd=workdir,
+                source_kind="cli",
+            )
+
+        async def resume_thread(self, *_args, **_kwargs) -> NativeThreadSummary:
+            raise AssertionError("resume_thread should not be called")
+
+        async def run_turn(
+            self,
+            thread_id: str,
+            prompt: str,
+            *,
+            cwd: str,
+            model: str,
+            reasoning_effort: str,
+            on_progress,
+            on_stream_text,
+            on_token_usage,
+        ):
+            raise RuntimeError(
+                "OpenAI API error: insufficient_quota: You exceeded your current quota."
+            )
+
+    service = make_service(tmp_path, model_cache_file)
+    service.native_client = QuotaFailingNativeClient()
+
+    result = await service.run_prompt("private_1", "hello")
+    expected_notice = "Codex 当前额度已用尽，请稍后重试或使用 /status 查看刷新时间。"
+
+    assert result.exit_code == 1
+    assert result.failure_notice == expected_notice
+
+
+@pytest.mark.asyncio
+async def test_run_prompt_resume_surfaces_quota_notice_from_native_diagnostics(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    class NativeDiagnosticClient:
+        def clone(self) -> NativeDiagnosticClient:
+            return self
+
+        async def close(self, timeout: float = 5.0) -> None:
+            return None
+
+        async def start_thread(
+            self,
+            *,
+            workdir: str,
+            model: str,
+            reasoning_effort: str,
+            permission_mode: str,
+        ) -> NativeThreadSummary:
+            return NativeThreadSummary(
+                thread_id="thread-1",
+                thread_name="Native Session",
+                updated_at="2025-03-01T00:00:00Z",
+                cwd=workdir,
+                source_kind="cli",
+            )
+
+        async def resume_thread(self, *_args, **_kwargs) -> NativeThreadSummary:
+            raise AssertionError("resume_thread should not be called")
+
+        async def run_turn(
+            self,
+            thread_id: str,
+            prompt: str,
+            *,
+            cwd: str,
+            model: str,
+            reasoning_effort: str,
+            on_progress,
+            on_stream_text,
+            on_token_usage,
+        ):
+            return type(
+                "NativeResult",
+                (),
+                {
+                    "thread_id": thread_id,
+                    "exit_code": 1,
+                    "final_text": "",
+                    "diagnostics": [
+                        "insufficient_quota",
+                        (
+                            "You exceeded your current quota, please check "
+                            "your plan and billing details."
+                        ),
+                    ],
+                },
+            )()
+
+    service = make_service(tmp_path, model_cache_file)
+    service.native_client = NativeDiagnosticClient()
+
+    result = await service.run_prompt("private_1", "hello")
+
+    assert result.exit_code == 1
+    assert result.failure_notice == (
+        "Codex 当前额度已用尽，请稍后重试或使用 /status 查看刷新时间。"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_prompt_resume_preserves_usage_limit_retry_time(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    class NativeUsageLimitClient:
+        def clone(self) -> NativeUsageLimitClient:
+            return self
+
+        async def close(self, timeout: float = 5.0) -> None:
+            return None
+
+        async def start_thread(
+            self,
+            *,
+            workdir: str,
+            model: str,
+            reasoning_effort: str,
+            permission_mode: str,
+        ) -> NativeThreadSummary:
+            return NativeThreadSummary(
+                thread_id="thread-1",
+                thread_name="Native Session",
+                updated_at="2025-03-01T00:00:00Z",
+                cwd=workdir,
+                source_kind="cli",
+            )
+
+        async def resume_thread(self, *_args, **_kwargs) -> NativeThreadSummary:
+            raise AssertionError("resume_thread should not be called")
+
+        async def run_turn(
+            self,
+            thread_id: str,
+            prompt: str,
+            *,
+            cwd: str,
+            model: str,
+            reasoning_effort: str,
+            on_progress,
+            on_stream_text,
+            on_token_usage,
+        ):
+            return type(
+                "NativeResult",
+                (),
+                {
+                    "thread_id": thread_id,
+                    "exit_code": 1,
+                    "final_text": "",
+                    "diagnostics": [
+                        (
+                            "You've hit your usage limit. To get more access now, "
+                            "send a request to your admin or try again at "
+                            "Mar 24th, 2026 1:04 PM."
+                        ),
+                    ],
+                },
+            )()
+
+    service = make_service(tmp_path, model_cache_file)
+    service.native_client = NativeUsageLimitClient()
+
+    result = await service.run_prompt("private_1", "hello")
+
+    assert result.exit_code == 1
+    assert result.failure_notice == (
+        "Codex 当前额度已用尽。\n"
+        "You've hit your usage limit. To get more access now, send a request "
+        "to your admin or try again at Mar 24th, 2026 1:04 PM."
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_prompt_resume_surfaces_rate_limit_notice(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    class RateLimitNativeClient:
+        def clone(self) -> RateLimitNativeClient:
+            return self
+
+        async def close(self, timeout: float = 5.0) -> None:
+            return None
+
+        async def start_thread(
+            self,
+            *,
+            workdir: str,
+            model: str,
+            reasoning_effort: str,
+            permission_mode: str,
+        ) -> NativeThreadSummary:
+            return NativeThreadSummary(
+                thread_id="thread-1",
+                thread_name="Native Session",
+                updated_at="2025-03-01T00:00:00Z",
+                cwd=workdir,
+                source_kind="cli",
+            )
+
+        async def resume_thread(self, *_args, **_kwargs) -> NativeThreadSummary:
+            raise AssertionError("resume_thread should not be called")
+
+        async def run_turn(
+            self,
+            thread_id: str,
+            prompt: str,
+            *,
+            cwd: str,
+            model: str,
+            reasoning_effort: str,
+            on_progress,
+            on_stream_text,
+            on_token_usage,
+        ):
+            raise RuntimeError("OpenAI API error: rate_limit_exceeded")
+
+    service = make_service(tmp_path, model_cache_file)
+    service.native_client = RateLimitNativeClient()
+
+    result = await service.run_prompt("private_1", "hello")
+
+    assert result.exit_code == 1
+    assert result.failure_notice == (
+        "Codex 当前请求过于频繁，请稍后重试或使用 /status 查看刷新时间。"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_prompt_exec_surfaces_quota_exhausted_notice_from_diagnostics(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    script = (
+        "import sys\n"
+        "sys.stderr.write('OpenAI API error: insufficient_quota\\n')\n"
+        "sys.stderr.flush()\n"
+        "raise SystemExit(1)\n"
+    )
+
+    async def launcher(*_args, **kwargs):
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            script,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=kwargs.get("stderr", asyncio.subprocess.PIPE),
+            limit=int(kwargs.get("limit", 1024)),
+        )
+
+    service = make_service(tmp_path, model_cache_file, launcher=launcher)
+
+    result = await service.run_prompt("private_1", "hello", mode_override="exec")
+
+    assert result.exit_code == 1
+    assert result.failure_notice == (
+        "Codex 当前额度已用尽，请稍后重试或使用 /status 查看刷新时间。"
+    )

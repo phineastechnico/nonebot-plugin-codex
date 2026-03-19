@@ -601,7 +601,7 @@ class TelegramHandlers:
             else:
                 status = "Codex 已完成，但没有返回可展示的最终文本。"
         else:
-            status = "Codex 执行失败。"
+            status = getattr(result, "failure_notice", "") or "Codex 执行失败。"
         for panel in (
             session.agent_panels[agent_key]
             for agent_key in session.agent_order

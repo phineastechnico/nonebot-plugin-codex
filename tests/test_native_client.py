@@ -1468,6 +1468,60 @@ async def test_native_client_ignores_subagent_turn_completed_until_main_turn_fin
 
 
 @pytest.mark.asyncio
+async def test_native_client_turn_completed_surfaces_structured_error_details() -> None:
+    process = FakeProcess(
+        stdout=FakeStdout(
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\n",
+                json.dumps({"jsonrpc": "2.0", "id": 2, "result": {}}) + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "turn/started",
+                        "params": {"threadId": "thread-1"},
+                    }
+                )
+                + "\n",
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turn": {
+                                "status": "failed",
+                                "error": {
+                                    "code": "insufficient_quota",
+                                    "message": (
+                                        "You exceeded your current quota, please "
+                                        "check your plan and billing details."
+                                    ),
+                                },
+                            },
+                        },
+                    }
+                )
+                + "\n",
+            ]
+        ),
+        stdin=FakeStdin(),
+    )
+
+    async def launcher(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        return process
+
+    client = NativeCodexClient(binary="codex", launcher=launcher)
+
+    result = await client.run_turn("thread-1", "hello")
+
+    assert result.exit_code == 1
+    assert result.diagnostics == [
+        "insufficient_quota",
+        "You exceeded your current quota, please check your plan and billing details.",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_native_client_reads_large_stdout_frame_without_readline_limit(
     tmp_path: Path,
 ) -> None:

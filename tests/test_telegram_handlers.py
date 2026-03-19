@@ -11,6 +11,7 @@ import pytest
 
 from nonebot.adapters.telegram.exception import ActionFailed, NetworkError
 from nonebot_plugin_codex.telegram import TelegramHandlers
+from nonebot_plugin_codex.telegram_rendering import render_telegram_html
 from nonebot_plugin_codex.service import (
     ChatSession,
     CodexBridgeService,
@@ -1042,6 +1043,119 @@ async def test_execute_prompt_does_not_mark_main_panel_completed_without_final_t
         for payload in bot.edited
     )
     assert bot.sent[-1]["text"] == "Codex 已完成，但没有返回可展示的最终文本。"
+
+
+@pytest.mark.asyncio
+async def test_execute_prompt_surfaces_friendly_quota_exhausted_notice() -> None:
+    service = FakeService()
+    service.run_updates = [
+        (
+            "progress",
+            SimpleNamespace(
+                agent_key="main",
+                agent_label="主 agent",
+                text="Codex 运行中…",
+            ),
+        ),
+    ]
+    service.run_result = SimpleNamespace(
+        cancelled=False,
+        exit_code=1,
+        final_text="",
+        notice="",
+        failure_notice="Codex 当前额度已用尽，请稍后重试或使用 /status 查看刷新时间。",
+        diagnostics=["insufficient_quota"],
+    )
+    handlers = TelegramHandlers(service)
+    bot = FakeBot()
+    expected_notice = "Codex 当前额度已用尽，请稍后重试或使用 /status 查看刷新时间。"
+
+    await handlers.execute_prompt(bot, FakeEvent(""), "hello")
+
+    assert any(
+        payload["message_id"] == 1
+        and payload["text"] == expected_notice
+        for payload in bot.edited
+    )
+    assert bot.sent[-1]["text"] == expected_notice
+
+
+@pytest.mark.asyncio
+async def test_execute_prompt_surfaces_usage_limit_retry_time() -> None:
+    service = FakeService()
+    service.run_updates = [
+        (
+            "progress",
+            SimpleNamespace(
+                agent_key="main",
+                agent_label="主 agent",
+                text="Codex 运行中…",
+            ),
+        ),
+    ]
+    service.run_result = SimpleNamespace(
+        cancelled=False,
+        exit_code=1,
+        final_text="",
+        notice="",
+        failure_notice=(
+            "Codex 当前额度已用尽。\n"
+            "You've hit your usage limit. To get more access now, send a "
+            "request to your admin or try again at Mar 24th, 2026 1:04 PM."
+        ),
+        diagnostics=[],
+    )
+    handlers = TelegramHandlers(service)
+    bot = FakeBot()
+    expected_notice = (
+        "Codex 当前额度已用尽。\n"
+        "You've hit your usage limit. To get more access now, send a request "
+        "to your admin or try again at Mar 24th, 2026 1:04 PM."
+    )
+    rendered_notice = render_telegram_html(expected_notice)
+
+    await handlers.execute_prompt(bot, FakeEvent(""), "hello")
+
+    assert any(
+        payload["message_id"] == 1 and payload["text"] == rendered_notice
+        for payload in bot.edited
+    )
+    assert bot.sent[-1]["text"] == rendered_notice
+
+
+@pytest.mark.asyncio
+async def test_execute_prompt_keeps_regular_notice_with_failure_details() -> None:
+    service = FakeService()
+    service.run_updates = [
+        (
+            "progress",
+            SimpleNamespace(
+                agent_key="main",
+                agent_label="主 agent",
+                text="Codex 运行中…",
+            ),
+        ),
+    ]
+    service.run_result = SimpleNamespace(
+        cancelled=False,
+        exit_code=1,
+        final_text="",
+        notice="原会话未成功恢复，已新开会话。",
+        failure_notice="",
+        diagnostics=["boom"],
+    )
+    handlers = TelegramHandlers(service)
+    bot = FakeBot()
+
+    await handlers.execute_prompt(bot, FakeEvent(""), "hello")
+
+    assert any(
+        payload["message_id"] == 1 and payload["text"] == "Codex 执行失败。"
+        for payload in bot.edited
+    )
+    assert bot.sent[-1]["text"] == (
+        "原会话未成功恢复，已新开会话。\n\nCodex 执行失败。\n\nboom"
+    )
 
 
 @pytest.mark.asyncio

@@ -52,6 +52,27 @@ WORKSPACE_CALLBACK_PREFIX = "cwp"
 WORKSPACE_STALE_MESSAGE = "工作台面板已失效，请重新执行 /panel"
 STATUS_CALLBACK_PREFIX = "cst"
 STATUS_STALE_MESSAGE = "状态面板已失效，请重新执行 /status"
+QUOTA_EXHAUSTED_NOTICE = "Codex 当前额度已用尽，请稍后重试或使用 /status 查看刷新时间。"
+RATE_LIMIT_NOTICE = "Codex 当前请求过于频繁，请稍后重试或使用 /status 查看刷新时间。"
+QUOTA_EXHAUSTED_PATTERNS = (
+    "insufficient_quota",
+    "billing_hard_limit_reached",
+    "credit balance is too low",
+    "quota exceeded",
+    "exceeded your current quota",
+    "usage limit reached",
+    "hit your usage limit",
+    "try again at",
+    "额度已用尽",
+    "额度用完",
+)
+RATE_LIMIT_PATTERNS = (
+    "rate_limit_exceeded",
+    "rate limit exceeded",
+    "rate limit reached",
+    "too many requests",
+    "请求过于频繁",
+)
 
 
 @dataclass(slots=True)
@@ -148,6 +169,7 @@ class RunResult:
     final_text: str = ""
     thread_id: str | None = None
     notice: str = ""
+    failure_notice: str = ""
     diagnostics: list[str] = field(default_factory=list)
     cancelled: bool = False
 
@@ -488,21 +510,66 @@ def chunk_text(text: str, limit: int) -> list[str]:
 
 def format_result_text(result: RunResult) -> str:
     parts: list[str] = []
-    if result.notice:
-        parts.append(result.notice)
+    notice = getattr(result, "notice", "")
+    failure_notice = getattr(result, "failure_notice", "")
     if result.cancelled:
+        if notice:
+            parts.append(notice)
         parts.append("Codex 已中断。")
         if result.final_text:
             parts.append(result.final_text)
+    elif result.exit_code != 0:
+        if notice:
+            parts.append(notice)
+        if failure_notice:
+            parts.append(failure_notice)
+        else:
+            parts.append("Codex 执行失败。")
+            if result.diagnostics:
+                parts.append("\n".join(result.diagnostics[-5:]))
     elif result.final_text:
+        if notice:
+            parts.append(notice)
         parts.append(result.final_text)
-    elif result.exit_code == 0:
-        parts.append("Codex 已完成，但没有返回可展示的最终文本。")
     else:
-        parts.append("Codex 执行失败。")
-        if result.diagnostics:
-            parts.append("\n".join(result.diagnostics[-5:]))
+        if notice:
+            parts.append(notice)
+        if result.exit_code == 0:
+            parts.append("Codex 已完成，但没有返回可展示的最终文本。")
+        else:
+            parts.append("Codex 执行失败。")
+            if result.diagnostics:
+                parts.append("\n".join(result.diagnostics[-5:]))
     return "\n\n".join(parts)
+
+
+def _match_failure_notice(lines: list[str]) -> str | None:
+    haystack = "\n".join(line for line in lines if line).casefold()
+    if not haystack:
+        return None
+    if any(pattern in haystack for pattern in QUOTA_EXHAUSTED_PATTERNS):
+        for line in lines:
+            if not line:
+                continue
+            normalized = line.casefold()
+            if "hit your usage limit" in normalized or "try again at" in normalized:
+                return f"Codex 当前额度已用尽。\n{line}"
+        return QUOTA_EXHAUSTED_NOTICE
+    if any(pattern in haystack for pattern in RATE_LIMIT_PATTERNS):
+        return RATE_LIMIT_NOTICE
+    return None
+
+
+def _apply_friendly_failure_notice(result: RunResult) -> RunResult:
+    if result.cancelled or result.exit_code == 0:
+        return result
+    failure_notice = _match_failure_notice([
+        result.notice,
+        *result.diagnostics,
+    ])
+    if failure_notice:
+        result.failure_notice = failure_notice
+    return result
 
 
 def format_preferences_summary(preferences: ChatPreferences) -> str:
@@ -3252,7 +3319,7 @@ class CodexBridgeService:
                 on_progress=on_progress,
                 on_stream_text=on_stream_text,
             )
-            return result
+            return _apply_friendly_failure_notice(result)
 
         result = await self._run_exec_prompt(
             session,
@@ -3262,7 +3329,7 @@ class CodexBridgeService:
             on_progress=on_progress,
             on_stream_text=on_stream_text,
         )
-        return result
+        return _apply_friendly_failure_notice(result)
 
     async def _run_exec_prompt(
         self,

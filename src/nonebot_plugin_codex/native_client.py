@@ -121,6 +121,30 @@ def _extract_compaction_notice(payload: object) -> str | None:
     return None
 
 
+def _extract_turn_error_details(error: object) -> list[str]:
+    details: list[str] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, str):
+            text = value.strip()
+            if text and text not in details:
+                details.append(text)
+            return
+        if isinstance(value, list):
+            for entry in value:
+                collect(entry)
+            return
+        if not isinstance(value, dict):
+            return
+        for key in ("code", "message", "type"):
+            collect(value.get(key))
+        for key in ("error", "cause", "details", "data"):
+            collect(value.get(key))
+
+    collect(error)
+    return details
+
+
 def _format_collab_tool_progress(
     item: dict[str, Any],
     *,
@@ -542,6 +566,7 @@ class NativeCodexClient:
                             await emit_stream_update("main", final_text)
                 status = turn.get("status")
                 error = turn.get("error")
+                diagnostics.extend(_extract_turn_error_details(error))
                 exit_code = 0 if status == "completed" and error is None else 1
                 return NativeRunResult(
                     exit_code=exit_code,
