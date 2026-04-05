@@ -198,7 +198,7 @@ codex_stream_read_limit = 8388608
 | `/start` | 打开使用引导面板 |
 | `/panel` | 打开统一工作台面板 |
 | `/status` | 打开统一工作台面板 |
-| `/mode [resume\|exec]` | 查看或切换默认模式 |
+| `/mode [resume\|exec\|plan]` | 查看或切换默认模式 |
 | `/exec <prompt>` | 以一次性 `exec` 模式执行任务 |
 | `/new` | 新建当前聊天会话 |
 | `/stop` | 停止当前聊天中的 Codex |
@@ -230,6 +230,14 @@ codex_stream_read_limit = 8388608
 - 使用 `codex exec --json`
 - 支持恢复已有 exec thread
 - 恢复失败时会自动新开会话并提示
+
+### `plan`
+
+适合先产出规划再决定是否执行的场景：
+
+- 使用 `codex exec --json` 维护 exec thread
+- 可与 `/sessions` 结合恢复此前规划上下文
+- 适合任务拆解、技术方案和实现步骤草拟
 
 ## 目录与历史会话
 

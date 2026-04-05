@@ -34,6 +34,7 @@ WhichResolver = Callable[[str], str | None]
 
 VISIBLE_MODEL = "list"
 SUPPORTED_PERMISSION_MODES = {"safe", "danger"}
+SUPPORTED_MODES = {"resume", "exec", "plan"}
 FALLBACK_MODEL = "gpt-5"
 FALLBACK_REASONING_EFFORT = "high"
 BROWSER_CALLBACK_PREFIX = "cdb"
@@ -2080,7 +2081,7 @@ class CodexBridgeService:
 
     def _workspace_active_mode(self, chat_key: str, preferences: ChatPreferences) -> str:
         session = self.sessions.get(chat_key)
-        if session is not None and session.active_mode in {"resume", "exec"}:
+        if session is not None and session.active_mode in SUPPORTED_MODES:
             return session.active_mode
         return preferences.default_mode
 
@@ -2090,12 +2091,12 @@ class CodexBridgeService:
             return "未开始"
         active_mode = (
             session.active_mode
-            if session.active_mode in {"resume", "exec"}
+            if session.active_mode in SUPPORTED_MODES
             else "resume"
         )
         thread_id = (
             self._current_exec_thread_id(session)
-            if active_mode == "exec"
+            if active_mode in {"exec", "plan"}
             else session.native_thread_id or session.thread_id
         )
         if not thread_id and not session.active:
@@ -2314,7 +2315,7 @@ class CodexBridgeService:
         session = self.sessions.get(chat_key)
         active_mode = (
             session.active_mode
-            if session is not None and session.active_mode in {"resume", "exec"}
+            if session is not None and session.active_mode in SUPPORTED_MODES
             else preferences.default_mode
         )
         has_bound_session = bool(
@@ -2409,6 +2410,7 @@ class CodexBridgeService:
                     "✓ resume" if preferences.default_mode == "resume" else "resume",
                 ),
                 ("exec", "✓ exec" if preferences.default_mode == "exec" else "exec"),
+                ("plan", "✓ plan" if preferences.default_mode == "plan" else "plan"),
             ]
         elif panel.kind == "model":
             lines = [
@@ -2630,7 +2632,7 @@ class CodexBridgeService:
                 default_mode=(
                     default_mode
                     if isinstance(default_mode, str)
-                    and default_mode in {"resume", "exec"}
+                    and default_mode in SUPPORTED_MODES
                     else "resume"
                 ),
             )
@@ -2738,7 +2740,7 @@ class CodexBridgeService:
 
     def activate_chat(self, chat_key: str) -> ChatSession:
         session = self.get_session(chat_key)
-        if not session.active or session.active_mode not in {"resume", "exec"}:
+        if not session.active or session.active_mode not in SUPPORTED_MODES:
             session.active_mode = self.get_preferences(chat_key).default_mode
         session.active = True
         self._sync_legacy_thread_id(session)
@@ -2750,7 +2752,7 @@ class CodexBridgeService:
             raise RuntimeError("Codex is already running for this chat")
 
     def _sync_legacy_thread_id(self, session: ChatSession) -> None:
-        if session.active_mode == "exec":
+        if session.active_mode in {"exec", "plan"}:
             session.thread_id = session.exec_thread_id or session.thread_id
             return
         if self.native_client is not None:
@@ -2763,7 +2765,7 @@ class CodexBridgeService:
 
     def _set_exec_thread_id(self, session: ChatSession, thread_id: str | None) -> None:
         session.exec_thread_id = thread_id
-        if session.active_mode == "exec" or self.native_client is None:
+        if session.active_mode in {"exec", "plan"} or self.native_client is None:
             session.thread_id = thread_id
 
     def _set_native_thread_id(self, session: ChatSession, thread_id: str | None) -> None:
@@ -3159,7 +3161,7 @@ class CodexBridgeService:
         preferences = self.preference_overrides.get(chat_key)
         if preferences is not None:
             session.active_mode = preferences.default_mode
-        elif session.active_mode not in {"resume", "exec"}:
+        elif session.active_mode not in SUPPORTED_MODES:
             session.active_mode = "resume"
         session.native_thread_id = None
         session.exec_thread_id = None
@@ -3267,8 +3269,8 @@ class CodexBridgeService:
 
     async def update_default_mode(self, chat_key: str, mode: str) -> str:
         self._ensure_not_running(chat_key)
-        if mode not in {"resume", "exec"}:
-            raise ValueError("仅支持 resume 或 exec。")
+        if mode not in SUPPORTED_MODES:
+            raise ValueError("仅支持 resume、exec 或 plan。")
 
         current = self.get_preferences(chat_key)
         self.preference_overrides[chat_key] = ChatPreferences(

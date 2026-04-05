@@ -496,6 +496,18 @@ async def test_update_default_mode_persists_preference_and_switches_active_mode(
 
 
 @pytest.mark.asyncio
+async def test_update_default_mode_accepts_plan(
+    tmp_path: Path, model_cache_file: Path
+) -> None:
+    service = make_service(tmp_path, model_cache_file)
+
+    notice = await service.update_default_mode("private_1", "plan")
+
+    assert notice == "当前默认模式：plan"
+    assert service.get_preferences("private_1").default_mode == "plan"
+
+
+@pytest.mark.asyncio
 async def test_update_workdir_clears_bound_threads(
     tmp_path: Path, model_cache_file: Path
 ) -> None:
@@ -731,6 +743,24 @@ def test_render_setting_panels_show_expected_headings(
 
     assert expected_heading in text
     assert markup.inline_keyboard
+
+
+def test_render_mode_setting_panel_shows_plan_option(
+    tmp_path: Path,
+    model_cache_file: Path,
+) -> None:
+    service = make_service(tmp_path, model_cache_file)
+
+    service.open_setting_panel("private_1", "mode")
+    _, markup = service.render_setting_panel("private_1")
+
+    callbacks = [
+        button.callback_data
+        for row in markup.inline_keyboard
+        for button in row
+        if button.callback_data is not None
+    ]
+    assert any(callback.endswith(":set:plan") for callback in callbacks)
 
 
 def test_render_workspace_panel_shows_current_state_and_recent_history(
